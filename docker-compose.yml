@@ -1,0 +1,40 @@
+name: am-backend
+
+# Local development setup — run `docker compose up` to start everything.
+#
+# This gives you:
+# - PostgreSQL database on port 5432
+# - The database is automatically created with the name "athletic_mindset"
+#
+# Your FastAPI app runs OUTSIDE Docker (with `uvicorn app.main:app --reload`)
+# so you get instant hot-reload during development. The app connects to
+# Postgres inside Docker via localhost:5432.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: am_postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: athletic_mindset
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  adminer:
+    image: adminer
+    container_name: am_adminer
+    ports:
+      - "8080:8080"
+    depends_on:
+      - postgres
+
+volumes:
+  postgres_data:
