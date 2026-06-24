@@ -51,10 +51,8 @@ uv add <package-name>
 
 ## Viewing the Database
 
-Use any Postgres GUI client:
-- **TablePlus** (macOS, free tier) — recommended
-- **pgAdmin** (free, web-based — comes with Postgres Docker images)
-- **DBeaver** (free, cross-platform)
+Adminer has been setup, you can simply view the database when running locally on:
+http://localhost:8080/
 
 Connection settings:
 - Host: localhost
