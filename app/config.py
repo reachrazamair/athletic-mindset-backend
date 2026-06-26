@@ -20,8 +20,12 @@ class Settings(BaseSettings):
     DEBUG: bool = False
 
     # --- Database ---
-    # This URL tells SQLAlchemy: use asyncpg driver, connect to postgres on localhost
     DATABASE_URL: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/athletic_mindset"
+
+    # --- Auth ---
+    SECRET_KEY: str = "change-me-in-production"
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 10080  # 7 days
+    ALGORITHM: str = "HS256"
 
     # --- CORS ---
     # Which URLs are allowed to call our API (your Next.js frontend)

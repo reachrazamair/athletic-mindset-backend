@@ -18,6 +18,7 @@ from sqlalchemy import text
 
 from app.config import settings
 from app.database import engine
+from app.routers import auth, admin
 
 
 @asynccontextmanager
@@ -62,6 +63,9 @@ app.add_middleware(
 
 
 # --- Routes ---
+
+app.include_router(auth.router)
+app.include_router(admin.router)
 
 
 @app.get("/health")
