@@ -30,7 +30,12 @@ async def register(body: RegisterRequest, db: AsyncSession = Depends(get_db)):
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Email already registered")
 
     # Create user
-    user = User(email=body.email, hashed_password=hash_password(body.password))
+    user = User(
+        email=body.email,
+        hashed_password=hash_password(body.password),
+        first_name=body.first_name,
+        last_name=body.last_name,
+    )
     db.add(user)
     await db.commit()
     await db.refresh(user)
