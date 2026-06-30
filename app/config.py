@@ -31,6 +31,16 @@ class Settings(BaseSettings):
     # Which URLs are allowed to call our API (your Next.js frontend)
     CORS_ORIGINS: list[str] = ["http://localhost:3000", "http://localhost:3001"]
 
+    # --- Frontend ---
+    # Base URL of the Next.js app — used to build links inside emails
+    FRONTEND_URL: str = "http://localhost:3000"
+
+    # --- Email ---
+    # If RESEND_API_KEY is set, emails are sent for real via Resend.
+    # If it's empty (local dev), emails are printed to the console instead.
+    RESEND_API_KEY: str = ""
+    EMAIL_FROM: str = "Athletic Mindset <onboarding@resend.dev>"
+
     # Tells Pydantic Settings to load from .env file
     model_config = SettingsConfigDict(
         env_file=".env",

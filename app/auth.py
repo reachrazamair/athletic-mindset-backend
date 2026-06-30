@@ -56,3 +56,27 @@ def decode_access_token(token: str) -> dict | None:
         return None
     except jwt.InvalidTokenError:
         return None
+
+
+def create_purpose_token(user_id: str, purpose: str, expire_minutes: int) -> str:
+    """
+    Create a short-lived, single-purpose JWT — used for password resets and
+    email verification. The `purpose` claim stops a reset token from being
+    used as a verification token (or as a login token).
+    """
+    expire = datetime.now(timezone.utc) + timedelta(minutes=expire_minutes)
+    payload = {"sub": user_id, "purpose": purpose, "exp": expire}
+    return jwt.encode(payload, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
+
+
+def decode_purpose_token(token: str, expected_purpose: str) -> str | None:
+    """
+    Decode a purpose token and confirm it matches the expected purpose.
+    Returns the user_id (sub) or None if invalid/expired/wrong purpose.
+    """
+    payload = decode_access_token(token)
+    if payload is None:
+        return None
+    if payload.get("purpose") != expected_purpose:
+        return None
+    return payload.get("sub")
