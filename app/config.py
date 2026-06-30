@@ -24,8 +24,10 @@ class Settings(BaseSettings):
 
     # --- Auth ---
     SECRET_KEY: str = "change-me-in-production"
-    ACCESS_TOKEN_EXPIRE_MINUTES: int = 10080  # 7 days
     ALGORITHM: str = "HS256"
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 10080  # login session length — 7 days
+    RESET_TOKEN_EXPIRE_MINUTES: int = 30  # password-reset link lifetime
+    VERIFY_TOKEN_EXPIRE_MINUTES: int = 1440  # email-verification link lifetime — 24h
 
     # --- CORS ---
     # Which URLs are allowed to call our API (your Next.js frontend)
