@@ -6,7 +6,7 @@ Pydantic validates everything automatically — bad data gets rejected before hi
 """
 
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 
 from pydantic import BaseModel, EmailStr, Field
 
@@ -80,7 +80,31 @@ class UserResponse(BaseModel):
     is_active: bool
     is_verified: bool
     roles: list[RoleResponse]
+    athlete_profile: "AthleteProfileResponse | None" = None
     created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+# --- Athlete Profile (onboarding demographics) ---
+
+class AthleteProfileUpdate(BaseModel):
+    birth_date: date | None = None
+    sex: str | None = Field(default=None, max_length=50)
+    ethnicity: str | None = Field(default=None, max_length=100)
+    primary_sport: str | None = Field(default=None, max_length=100)
+    competition_level: str | None = Field(default=None, max_length=100)
+    position: str | None = Field(default=None, max_length=100)
+
+
+class AthleteProfileResponse(BaseModel):
+    birth_date: date | None
+    sex: str | None
+    ethnicity: str | None
+    primary_sport: str | None
+    competition_level: str | None
+    position: str | None
 
     class Config:
         from_attributes = True
