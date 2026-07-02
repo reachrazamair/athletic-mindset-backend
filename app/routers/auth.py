@@ -29,6 +29,7 @@ from app.email import render_email, send_email
 from app.models import RoleEnum, User, UserRole
 from app.schemas import (
     ChangePasswordRequest,
+    DeactivateAccountRequest,
     ForgotPasswordRequest,
     LoginRequest,
     MessageResponse,
@@ -266,3 +267,24 @@ async def change_password(
     user.hashed_password = hash_password(body.new_password)
     await db.commit()
     return MessageResponse(message="Your password has been updated.")
+
+
+@router.post("/deactivate", response_model=MessageResponse)
+async def deactivate_account(
+    body: DeactivateAccountRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Deactivate the current user's account. Requires password confirmation.
+    The account is soft-deleted (is_active = False) — login will be blocked.
+    """
+    if not verify_password(body.password, user.hashed_password):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Password is incorrect.",
+        )
+
+    user.is_active = False
+    await db.commit()
+    return MessageResponse(message="Your account has been deactivated.")

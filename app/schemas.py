@@ -110,6 +110,12 @@ class AthleteProfileResponse(BaseModel):
         from_attributes = True
 
 
+# --- Account Deletion ---
+
+class DeactivateAccountRequest(BaseModel):
+    password: str
+
+
 # --- Admin ---
 
 class CreateAdminRequest(BaseModel):
