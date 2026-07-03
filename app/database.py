@@ -27,6 +27,7 @@ engine = create_async_engine(
     echo=settings.DEBUG,
     pool_pre_ping=True,
     pool_recycle=300,
+    connect_args={"statement_cache_size": 0},
 )
 
 # Factory that creates new sessions
