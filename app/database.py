@@ -18,10 +18,15 @@ from sqlalchemy.orm import DeclarativeBase
 from app.config import settings
 
 # Create the connection pool
-# echo=True means it prints every SQL query to the terminal (great for learning)
+# - echo prints SQL when DEBUG is on (local only)
+# - pool_pre_ping checks a connection is alive before using it (managed/serverless
+#   Postgres like Neon drops idle connections, so this avoids stale-connection errors)
+# - pool_recycle refreshes connections periodically for the same reason
 engine = create_async_engine(
     settings.DATABASE_URL,
     echo=settings.DEBUG,
+    pool_pre_ping=True,
+    pool_recycle=300,
 )
 
 # Factory that creates new sessions
