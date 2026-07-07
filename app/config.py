@@ -43,6 +43,17 @@ class Settings(BaseSettings):
     RESEND_API_KEY: str = ""
     EMAIL_FROM: str = "Athletic Mindset <onboarding@resend.dev>"
 
+    # --- Content translation (CMS) ---
+    # English is the master that everything is translated from. The backend does
+    # NOT keep its own list of languages: it translates a language on first
+    # request and updates every language that already exists when English is
+    # saved. So the frontend languages list stays the single source of truth and
+    # this never needs manual syncing.
+    CONTENT_MASTER_LOCALE: str = "en"
+    # DeepL is used to auto-translate content when English is saved.
+    DEEPL_API_KEY: str = ""
+    DEEPL_API_URL: str = "https://api-free.deepl.com/v2/translate"
+
     # Tells Pydantic Settings to load from .env file
     model_config = SettingsConfigDict(
         env_file=".env",

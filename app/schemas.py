@@ -123,3 +123,31 @@ class CreateAdminRequest(BaseModel):
     password: str = Field(min_length=8, max_length=128)
     first_name: str | None = None
     last_name: str | None = None
+
+
+# --- Content (CMS) ---
+
+class ContentItem(BaseModel):
+    """One editable string, keyed by name. Value is always the English (master)."""
+    key: str = Field(min_length=1, max_length=255)
+    value: str
+
+
+class SaveContentRequest(BaseModel):
+    """Save one or more English strings. Other languages are auto-translated."""
+    items: list[ContentItem] = Field(min_length=1)
+
+
+class ContentEntryResponse(BaseModel):
+    key: str
+    locale: str
+    value: str
+
+    class Config:
+        from_attributes = True
+
+
+class SaveContentResponse(BaseModel):
+    saved: int
+    locales: list[str]
+    translated: bool

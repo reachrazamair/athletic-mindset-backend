@@ -9,7 +9,7 @@ import enum
 import uuid
 from datetime import date, datetime
 
-from sqlalchemy import Boolean, Date, DateTime, Enum, ForeignKey, String, UniqueConstraint
+from sqlalchemy import Boolean, Date, DateTime, Enum, ForeignKey, String, Text, UniqueConstraint
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.sql import func
@@ -71,6 +71,27 @@ class AthleteProfile(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
     user: Mapped["User"] = relationship("User", back_populates="athlete_profile")
+
+
+class ContentEntry(Base):
+    """
+    One piece of editable site text, in one language.
+
+    Every string Admin can edit lives here as (key, locale) → value. For example
+    key "home.hero.title" has one row for "en" and one for "es". English is the
+    master; other languages are auto-translated from it and can be re-saved.
+    """
+
+    __tablename__ = "content_entries"
+    __table_args__ = (UniqueConstraint("key", "locale", name="uq_content_key_locale"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    key: Mapped[str] = mapped_column(String(255), index=True, nullable=False)
+    locale: Mapped[str] = mapped_column(String(10), index=True, nullable=False)
+    value: Mapped[str] = mapped_column(Text, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
 
 
 class UserRole(Base):
