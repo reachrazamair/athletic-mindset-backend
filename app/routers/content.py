@@ -120,6 +120,16 @@ async def _upsert(db: AsyncSession, key: str, locale: str, value: str) -> None:
         entry.value = value
 
 
+@router.get("/admin/languages", response_model=list[str])
+async def list_languages(
+    _: User = Depends(require_role("admin")),
+    db: AsyncSession = Depends(get_db),
+):
+    """Which languages currently exist in the database (for the CMS indicator)."""
+    result = await db.execute(select(ContentEntry.locale).distinct())
+    return sorted({row[0] for row in result.all()})
+
+
 @router.get("/admin/content", response_model=list[ContentEntryResponse])
 async def list_content(
     _: User = Depends(require_role("admin")),

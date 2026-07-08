@@ -38,6 +38,14 @@ async def lifespan(app: FastAPI):
         print(f"❌ Database connection failed: {e}")
         print("   Make sure Postgres is running (docker compose up)")
 
+    # Auto-seed any missing site content so deploys need no manual seed step.
+    try:
+        from app.seed_content import ensure_seeded
+
+        await ensure_seeded()
+    except Exception as e:  # noqa: BLE001 — seeding must never block startup
+        print(f"⚠️  Content seeding skipped: {e}")
+
     yield  # App runs here
 
     # Shutdown: close connections
