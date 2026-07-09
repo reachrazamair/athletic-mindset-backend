@@ -38,7 +38,14 @@ router = APIRouter(tags=["content"])
 # Content changes rarely (only when Casey saves), so caching avoids a DB hit on
 # every page load. The cache is cleared whenever content is saved.
 _content_cache: dict[str, dict[str, str]] = {}
-_cache_lock = asyncio.Lock()
+_cache_locks: dict[str, asyncio.Lock] = {}
+
+
+def _get_lock(locale: str) -> asyncio.Lock:
+    """Per-locale lock so building one language doesn't block others."""
+    if locale not in _cache_locks:
+        _cache_locks[locale] = asyncio.Lock()
+    return _cache_locks[locale]
 
 
 def _clear_cache() -> None:
@@ -96,7 +103,8 @@ async def get_content(locale: str, db: AsyncSession = Depends(get_db)) -> dict[s
     if cached is not None:
         return cached
 
-    async with _cache_lock:
+    lock = _get_lock(locale)
+    async with lock:
         # Re-check inside the lock in case another request just built it.
         cached = _content_cache.get(locale)
         if cached is not None:

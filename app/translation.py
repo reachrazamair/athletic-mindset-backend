@@ -11,9 +11,14 @@ If no key is configured, `translate` returns None and the caller simply leaves
 that language to fall back to English — nothing breaks.
 """
 
+import asyncio
+
 import httpx
 
 from app.config import settings
+
+# DeepL recommends keeping requests under 50 texts for reliability.
+_CHUNK_SIZE = 50
 
 
 async def translate(text: str, target_locale: str) -> str | None:
@@ -29,7 +34,11 @@ async def translate(text: str, target_locale: str) -> str | None:
 
 async def translate_batch(texts: list[str], target_locale: str) -> list[str | None]:
     """
-    Translate several English strings into `target_locale` in one request.
+    Translate several English strings into `target_locale`.
+
+    Automatically chunks large batches into groups of _CHUNK_SIZE to avoid
+    hitting DeepL request size limits and timeouts. Chunks run concurrently
+    for speed.
 
     Returns a list the same length as `texts`; any position we couldn't
     translate comes back as None.
@@ -41,6 +50,21 @@ async def translate_batch(texts: list[str], target_locale: str) -> list[str | No
         # No provider configured — signal "no translation available".
         return [None] * len(texts)
 
+    # Split into manageable chunks.
+    if len(texts) <= _CHUNK_SIZE:
+        return await _translate_chunk(texts, target_locale)
+
+    # Run chunks concurrently for speed.
+    chunks = [texts[i : i + _CHUNK_SIZE] for i in range(0, len(texts), _CHUNK_SIZE)]
+    results = await asyncio.gather(
+        *[_translate_chunk(chunk, target_locale) for chunk in chunks]
+    )
+    # Flatten list of lists into a single list preserving order.
+    return [item for sublist in results for item in sublist]
+
+
+async def _translate_chunk(texts: list[str], target_locale: str) -> list[str | None]:
+    """Translate a single chunk (≤ _CHUNK_SIZE texts) via DeepL."""
     payload = {
         "text": texts,
         "target_lang": target_locale.upper(),
@@ -49,7 +73,7 @@ async def translate_batch(texts: list[str], target_locale: str) -> list[str | No
     }
 
     try:
-        async with httpx.AsyncClient(timeout=20.0) as client:
+        async with httpx.AsyncClient(timeout=60.0) as client:
             response = await client.post(
                 settings.DEEPL_API_URL,
                 headers={
