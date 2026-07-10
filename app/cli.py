@@ -26,8 +26,8 @@ async def create_admin(email: str, password: str):
             print(f"❌ User with email {email} already exists")
             return
 
-        # Create user
-        user = User(email=email, hashed_password=hash_password(password))
+        # Create user (admins are created already verified)
+        user = User(email=email, hashed_password=hash_password(password), is_verified=True)
         db.add(user)
         await db.flush()
 
