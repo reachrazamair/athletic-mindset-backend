@@ -12,7 +12,7 @@ from app.auth import hash_password
 from app.database import get_db
 from app.dependencies import require_role
 from app.models import RoleEnum, User, UserRole
-from app.schemas import CreateAdminRequest, UserResponse
+from app.schemas import CreateAdminRequest, MessageResponse, UserResponse
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
@@ -81,3 +81,23 @@ async def toggle_user_status(
     await db.refresh(user)
 
     return UserResponse.model_validate(user)
+
+
+@router.delete("/users/{user_id}", response_model=MessageResponse)
+async def delete_user(
+    user_id: UUID,
+    admin: User = Depends(require_role("admin")),
+    db: AsyncSession = Depends(get_db),
+):
+    """Permanently delete a user (and their roles/profile). Admins can't delete themselves."""
+    if user_id == admin.id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="You cannot delete your own account.")
+
+    result = await db.execute(select(User).where(User.id == user_id))
+    user = result.scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+
+    await db.delete(user)
+    await db.commit()
+    return MessageResponse(message="User deleted.")
