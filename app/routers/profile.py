@@ -28,6 +28,7 @@ async def get_profile(user: User = Depends(get_current_user)):
             primary_sport=None,
             competition_level=None,
             position=None,
+            sport_category=None,
         )
     return AthleteProfileResponse.model_validate(user.athlete_profile)
 

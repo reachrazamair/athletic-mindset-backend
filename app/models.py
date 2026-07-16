@@ -9,8 +9,8 @@ import enum
 import uuid
 from datetime import date, datetime
 
-from sqlalchemy import Boolean, Date, DateTime, Enum, ForeignKey, String, Text, UniqueConstraint
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy import Boolean, Date, DateTime, Enum, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.sql import func
 
@@ -22,6 +22,17 @@ class RoleEnum(str, enum.Enum):
     parent = "parent"
     coach = "coach"
     admin = "admin"
+
+
+class SportCategoryEnum(str, enum.Enum):
+    """
+    Team / Individual / Combat — chosen directly by the athlete as part of the
+    assessment's registration step (see AM Assessment Framework v1, Section 1).
+    Drives which adaptive question text an assessment shows.
+    """
+    team = "team"
+    individual = "individual"
+    combat = "combat"
 
 
 class User(Base):
@@ -66,6 +77,8 @@ class AthleteProfile(Base):
     primary_sport: Mapped[str | None] = mapped_column(String(100), nullable=True)
     competition_level: Mapped[str | None] = mapped_column(String(100), nullable=True)
     position: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    # Team / Individual / Combat — set during the assessment's registration step.
+    sport_category: Mapped[SportCategoryEnum | None] = mapped_column(Enum(SportCategoryEnum), nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
@@ -105,3 +118,187 @@ class UserRole(Base):
 
     # Relationships
     user: Mapped["User"] = relationship("User", back_populates="roles")
+
+
+# --- Assessment ---
+
+
+class QuestionTypeEnum(str, enum.Enum):
+    likert = "likert"
+    scenario = "scenario"
+
+
+class MeasurementTypeEnum(str, enum.Enum):
+    trait = "trait"
+    state = "state"
+
+
+class QuestionTierEnum(str, enum.Enum):
+    free = "free"
+    elite = "elite"
+
+
+class AssessmentSessionStatus(str, enum.Enum):
+    in_progress = "in_progress"
+    completed = "completed"
+
+
+class AssessmentPhase(Base):
+    """Top-level grouping: Preparation, Competition, Teamwork."""
+
+    __tablename__ = "assessment_phases"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    key: Mapped[str] = mapped_column(String(50), unique=True, nullable=False)
+    name: Mapped[str] = mapped_column(String(100), nullable=False)
+    order: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    factors: Mapped[list["AssessmentFactor"]] = relationship(
+        "AssessmentFactor", back_populates="phase", order_by="AssessmentFactor.order",
+        cascade="all, delete-orphan",
+    )
+
+
+class AssessmentFactor(Base):
+    """Mid-level grouping within a phase, e.g. Grit, Coachability, Drive."""
+
+    __tablename__ = "assessment_factors"
+    __table_args__ = (UniqueConstraint("phase_id", "key", name="uq_factor_phase_key"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    phase_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("assessment_phases.id", ondelete="CASCADE"), nullable=False
+    )
+    key: Mapped[str] = mapped_column(String(50), nullable=False)
+    name: Mapped[str] = mapped_column(String(100), nullable=False)
+    order: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    phase: Mapped["AssessmentPhase"] = relationship("AssessmentPhase", back_populates="factors")
+    dimensions: Mapped[list["AssessmentDimension"]] = relationship(
+        "AssessmentDimension", back_populates="factor", order_by="AssessmentDimension.order",
+        cascade="all, delete-orphan",
+    )
+
+
+class AssessmentDimension(Base):
+    """Granular measure within a factor, e.g. Persistence, Intrinsic Motivation."""
+
+    __tablename__ = "assessment_dimensions"
+    __table_args__ = (UniqueConstraint("factor_id", "key", name="uq_dimension_factor_key"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    factor_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("assessment_factors.id", ondelete="CASCADE"), nullable=False
+    )
+    key: Mapped[str] = mapped_column(String(50), nullable=False)
+    name: Mapped[str] = mapped_column(String(100), nullable=False)
+    order: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    factor: Mapped["AssessmentFactor"] = relationship("AssessmentFactor", back_populates="dimensions")
+    questions: Mapped[list["AssessmentQuestion"]] = relationship(
+        "AssessmentQuestion", back_populates="dimension", order_by="AssessmentQuestion.order",
+    )
+
+
+class AssessmentQuestion(Base):
+    """
+    One question in the bank. `prompt` is the universal/default wording; the
+    JSON override fields hold sport-category- and position-specific variants
+    that the resolver swaps in based on the athlete's profile. Everything here
+    is admin-editable — nothing about a question is hardcoded in application
+    code beyond the resolution order (position > sport category > default).
+    """
+
+    __tablename__ = "assessment_questions"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    dimension_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("assessment_dimensions.id", ondelete="CASCADE"), nullable=False
+    )
+    order: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    prompt: Mapped[str] = mapped_column(Text, nullable=False)
+    helper_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    question_type: Mapped[QuestionTypeEnum] = mapped_column(Enum(QuestionTypeEnum), nullable=False)
+    measurement_type: Mapped[MeasurementTypeEnum] = mapped_column(Enum(MeasurementTypeEnum), nullable=False)
+    tier: Mapped[QuestionTierEnum] = mapped_column(Enum(QuestionTierEnum), nullable=False, default=QuestionTierEnum.free)
+    reverse_scored: Mapped[bool] = mapped_column(Boolean, default=False)
+    # {"individual": "...", "combat": "..."} — category key -> replacement prompt text
+    sport_category_overrides: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    # {"QB": "...", "Goalie": "..."} — position name -> replacement prompt text
+    position_overrides: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    dimension: Mapped["AssessmentDimension"] = relationship("AssessmentDimension", back_populates="questions")
+    options: Mapped[list["AssessmentQuestionOption"]] = relationship(
+        "AssessmentQuestionOption", back_populates="question", order_by="AssessmentQuestionOption.order",
+        cascade="all, delete-orphan",
+    )
+
+
+class AssessmentQuestionOption(Base):
+    """One lettered answer choice (A-E) for a question."""
+
+    __tablename__ = "assessment_question_options"
+    __table_args__ = (UniqueConstraint("question_id", "label", name="uq_option_question_label"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    question_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("assessment_questions.id", ondelete="CASCADE"), nullable=False
+    )
+    label: Mapped[str] = mapped_column(String(1), nullable=False)
+    text: Mapped[str] = mapped_column(Text, nullable=False)
+    score: Mapped[int] = mapped_column(Integer, nullable=False)
+    tag: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    order: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    question: Mapped["AssessmentQuestion"] = relationship("AssessmentQuestion", back_populates="options")
+
+
+class AssessmentSession(Base):
+    """One athlete's attempt at the assessment (a tier's worth of questions)."""
+
+    __tablename__ = "assessment_sessions"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    tier: Mapped[QuestionTierEnum] = mapped_column(Enum(QuestionTierEnum), nullable=False)
+    status: Mapped[AssessmentSessionStatus] = mapped_column(
+        Enum(AssessmentSessionStatus), nullable=False, default=AssessmentSessionStatus.in_progress
+    )
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    responses: Mapped[list["AssessmentResponse"]] = relationship(
+        "AssessmentResponse", back_populates="session", cascade="all, delete-orphan",
+    )
+
+
+class AssessmentResponse(Base):
+    """One answered question within a session. Raw storage only — no scoring."""
+
+    __tablename__ = "assessment_responses"
+    __table_args__ = (UniqueConstraint("session_id", "question_id", name="uq_response_session_question"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    session_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("assessment_sessions.id", ondelete="CASCADE"), nullable=False
+    )
+    question_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("assessment_questions.id", ondelete="CASCADE"), nullable=False
+    )
+    option_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("assessment_question_options.id", ondelete="CASCADE"), nullable=False
+    )
+    answered_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    session: Mapped["AssessmentSession"] = relationship("AssessmentSession", back_populates="responses")

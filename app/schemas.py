@@ -96,6 +96,7 @@ class AthleteProfileUpdate(BaseModel):
     primary_sport: str | None = Field(default=None, max_length=100)
     competition_level: str | None = Field(default=None, max_length=100)
     position: str | None = Field(default=None, max_length=100)
+    sport_category: str | None = Field(default=None, pattern="^(team|individual|combat)$")
 
 
 class AthleteProfileResponse(BaseModel):
@@ -105,6 +106,7 @@ class AthleteProfileResponse(BaseModel):
     primary_sport: str | None
     competition_level: str | None
     position: str | None
+    sport_category: str | None
 
     class Config:
         from_attributes = True
@@ -151,3 +153,219 @@ class SaveContentResponse(BaseModel):
     saved: int
     locales: list[str]
     translated: bool
+
+
+# --- Assessment: taxonomy (admin) ---
+
+class PhaseCreate(BaseModel):
+    key: str = Field(min_length=1, max_length=50)
+    name: str = Field(min_length=1, max_length=100)
+    order: int = 0
+
+
+class PhaseUpdate(BaseModel):
+    key: str | None = Field(default=None, min_length=1, max_length=50)
+    name: str | None = Field(default=None, min_length=1, max_length=100)
+    order: int | None = None
+
+
+class PhaseResponse(BaseModel):
+    id: uuid.UUID
+    key: str
+    name: str
+    order: int
+
+    class Config:
+        from_attributes = True
+
+
+class FactorCreate(BaseModel):
+    phase_id: uuid.UUID
+    key: str = Field(min_length=1, max_length=50)
+    name: str = Field(min_length=1, max_length=100)
+    order: int = 0
+
+
+class FactorUpdate(BaseModel):
+    phase_id: uuid.UUID | None = None
+    key: str | None = Field(default=None, min_length=1, max_length=50)
+    name: str | None = Field(default=None, min_length=1, max_length=100)
+    order: int | None = None
+
+
+class FactorResponse(BaseModel):
+    id: uuid.UUID
+    phase_id: uuid.UUID
+    key: str
+    name: str
+    order: int
+
+    class Config:
+        from_attributes = True
+
+
+class DimensionCreate(BaseModel):
+    factor_id: uuid.UUID
+    key: str = Field(min_length=1, max_length=50)
+    name: str = Field(min_length=1, max_length=100)
+    order: int = 0
+
+
+class DimensionUpdate(BaseModel):
+    factor_id: uuid.UUID | None = None
+    key: str | None = Field(default=None, min_length=1, max_length=50)
+    name: str | None = Field(default=None, min_length=1, max_length=100)
+    order: int | None = None
+
+
+class DimensionResponse(BaseModel):
+    id: uuid.UUID
+    factor_id: uuid.UUID
+    key: str
+    name: str
+    order: int
+
+    class Config:
+        from_attributes = True
+
+
+class DimensionNode(DimensionResponse):
+    pass
+
+
+class FactorNode(FactorResponse):
+    dimensions: list[DimensionNode] = []
+
+
+class PhaseNode(PhaseResponse):
+    factors: list[FactorNode] = []
+
+
+class TaxonomyResponse(BaseModel):
+    """Full phase -> factor -> dimension tree, for admin pickers."""
+    phases: list[PhaseNode]
+
+
+# --- Assessment: questions (admin) ---
+
+class QuestionOptionInput(BaseModel):
+    label: str = Field(min_length=1, max_length=1)
+    text: str = Field(min_length=1)
+    score: int = Field(ge=1, le=5)
+    tag: str | None = Field(default=None, max_length=100)
+    order: int = 0
+
+
+class QuestionOptionResponse(BaseModel):
+    id: uuid.UUID
+    label: str
+    text: str
+    score: int
+    tag: str | None
+    order: int
+
+    class Config:
+        from_attributes = True
+
+
+class QuestionCreate(BaseModel):
+    dimension_id: uuid.UUID
+    order: int = 0
+    prompt: str = Field(min_length=1)
+    helper_text: str | None = None
+    question_type: str = Field(pattern="^(likert|scenario)$")
+    measurement_type: str = Field(pattern="^(trait|state)$")
+    tier: str = Field(pattern="^(free|elite)$")
+    reverse_scored: bool = False
+    sport_category_overrides: dict[str, str] | None = None
+    position_overrides: dict[str, str] | None = None
+    is_active: bool = True
+    options: list[QuestionOptionInput] = Field(min_length=2, max_length=6)
+
+
+class QuestionUpdate(BaseModel):
+    dimension_id: uuid.UUID | None = None
+    order: int | None = None
+    prompt: str | None = Field(default=None, min_length=1)
+    helper_text: str | None = None
+    question_type: str | None = Field(default=None, pattern="^(likert|scenario)$")
+    measurement_type: str | None = Field(default=None, pattern="^(trait|state)$")
+    tier: str | None = Field(default=None, pattern="^(free|elite)$")
+    reverse_scored: bool | None = None
+    sport_category_overrides: dict[str, str] | None = None
+    position_overrides: dict[str, str] | None = None
+    is_active: bool | None = None
+    options: list[QuestionOptionInput] | None = Field(default=None, min_length=2, max_length=6)
+
+
+class QuestionAdminResponse(BaseModel):
+    id: uuid.UUID
+    dimension_id: uuid.UUID
+    phase_name: str
+    factor_name: str
+    dimension_name: str
+    order: int
+    prompt: str
+    helper_text: str | None
+    question_type: str
+    measurement_type: str
+    tier: str
+    reverse_scored: bool
+    sport_category_overrides: dict[str, str] | None
+    position_overrides: dict[str, str] | None
+    is_active: bool
+    options: list[QuestionOptionResponse]
+
+
+class QuestionReorderItem(BaseModel):
+    id: uuid.UUID
+    order: int
+
+
+class QuestionReorderRequest(BaseModel):
+    items: list[QuestionReorderItem] = Field(min_length=1)
+
+
+# --- Assessment: athlete-facing ---
+
+class ResolvedOptionResponse(BaseModel):
+    """An answer choice as shown to the athlete — no score or tag leaked."""
+    id: uuid.UUID
+    label: str
+    text: str
+
+
+class ResolvedQuestionResponse(BaseModel):
+    """A question with its text already resolved for the athlete's profile."""
+    id: uuid.UUID
+    order: int
+    prompt: str
+    helper_text: str | None
+    question_type: str
+    measurement_type: str
+    options: list[ResolvedOptionResponse]
+
+
+class AssessmentSessionRequest(BaseModel):
+    tier: str = Field(pattern="^(free|elite)$")
+
+
+class AssessmentSessionResponse(BaseModel):
+    id: uuid.UUID
+    tier: str
+    status: str
+    started_at: datetime
+    completed_at: datetime | None
+
+    class Config:
+        from_attributes = True
+
+
+class AssessmentSessionAnswerRequest(BaseModel):
+    question_id: uuid.UUID
+    option_id: uuid.UUID
+
+
+class AssessmentSessionCurrentResponse(BaseModel):
+    session: AssessmentSessionResponse | None
+    answers: dict[uuid.UUID, uuid.UUID]

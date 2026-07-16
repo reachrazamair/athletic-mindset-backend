@@ -18,7 +18,7 @@ from sqlalchemy import text
 
 from app.config import settings
 from app.database import engine
-from app.routers import auth, admin, profile, content
+from app.routers import auth, admin, admin_assessment, assessment, profile, content
 
 
 @asynccontextmanager
@@ -45,6 +45,14 @@ async def lifespan(app: FastAPI):
         await ensure_seeded()
     except Exception as e:  # noqa: BLE001 — seeding must never block startup
         print(f"⚠️  Content seeding skipped: {e}")
+
+    # Auto-seed the assessment question bank on first run only (admins own it after that).
+    try:
+        from app.seed_assessment import ensure_seeded as ensure_assessment_seeded
+
+        await ensure_assessment_seeded()
+    except Exception as e:  # noqa: BLE001 — seeding must never block startup
+        print(f"⚠️  Assessment seeding skipped: {e}")
 
     yield  # App runs here
 
@@ -76,6 +84,8 @@ app.include_router(auth.router)
 app.include_router(admin.router)
 app.include_router(profile.router)
 app.include_router(content.router)
+app.include_router(assessment.router)
+app.include_router(admin_assessment.router)
 
 
 @app.get("/health")
