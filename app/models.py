@@ -53,6 +53,9 @@ class User(Base):
     athlete_profile: Mapped["AthleteProfile | None"] = relationship(
         "AthleteProfile", back_populates="user", uselist=False, lazy="selectin", cascade="all, delete-orphan"
     )
+    subscription: Mapped["Subscription | None"] = relationship(
+        "Subscription", back_populates="user", uselist=False, lazy="selectin", cascade="all, delete-orphan"
+    )
 
 
 class AthleteProfile(Base):
@@ -84,6 +87,53 @@ class AthleteProfile(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
     user: Mapped["User"] = relationship("User", back_populates="athlete_profile")
+
+
+class SubscriptionStatus(str, enum.Enum):
+    """Mirrors Stripe's own subscription status values (see Stripe docs)."""
+    incomplete = "incomplete"
+    trialing = "trialing"
+    active = "active"
+    past_due = "past_due"
+    canceled = "canceled"
+    unpaid = "unpaid"
+
+
+class SubscriptionPlan(str, enum.Enum):
+    """Which pricing-page tier this subscription is for (see landing/Pricing.tsx). Team is sales-assisted, never created here."""
+    free = "free"
+    elite = "elite"
+    team = "team"
+
+
+class Subscription(Base):
+    """
+    One row per user tracking their plan — the single source of truth for
+    whether the assessment is unlocked. The free plan is granted directly
+    (see POST /billing/subscribe-free); paid plans are kept in sync via
+    Stripe webhooks (see app/routers/billing.py). Nothing here is admin-edited.
+    """
+
+    __tablename__ = "subscriptions"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), unique=True, nullable=False
+    )
+    plan: Mapped[SubscriptionPlan] = mapped_column(Enum(SubscriptionPlan), nullable=False, default=SubscriptionPlan.free)
+    # Null for a free plan granted before Stripe keys were configured — every
+    # paid plan has one, created lazily on first checkout.
+    stripe_customer_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    stripe_subscription_id: Mapped[str | None] = mapped_column(String(255), unique=True, nullable=True)
+    status: Mapped[SubscriptionStatus] = mapped_column(
+        Enum(SubscriptionStatus), nullable=False, default=SubscriptionStatus.incomplete
+    )
+    current_period_end: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    cancel_at_period_end: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    user: Mapped["User"] = relationship("User", back_populates="subscription")
 
 
 class ContentEntry(Base):
@@ -136,6 +186,12 @@ class MeasurementTypeEnum(str, enum.Enum):
 class QuestionTierEnum(str, enum.Enum):
     free = "free"
     elite = "elite"
+
+
+class ResponseModeEnum(str, enum.Enum):
+    """How the athlete answers a question."""
+    single_select = "single_select"  # pick the one option that fits best
+    rate_all = "rate_all"  # rate every option's effectiveness (situational judgment / SJT format)
 
 
 class AssessmentSessionStatus(str, enum.Enum):
@@ -227,6 +283,9 @@ class AssessmentQuestion(Base):
     question_type: Mapped[QuestionTypeEnum] = mapped_column(Enum(QuestionTypeEnum), nullable=False)
     measurement_type: Mapped[MeasurementTypeEnum] = mapped_column(Enum(MeasurementTypeEnum), nullable=False)
     tier: Mapped[QuestionTierEnum] = mapped_column(Enum(QuestionTierEnum), nullable=False, default=QuestionTierEnum.free)
+    response_mode: Mapped[ResponseModeEnum] = mapped_column(
+        Enum(ResponseModeEnum), nullable=False, default=ResponseModeEnum.single_select
+    )
     reverse_scored: Mapped[bool] = mapped_column(Boolean, default=False)
     # {"individual": "...", "combat": "..."} — category key -> replacement prompt text
     sport_category_overrides: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
@@ -284,10 +343,19 @@ class AssessmentSession(Base):
 
 
 class AssessmentResponse(Base):
-    """One answered question within a session. Raw storage only — no scoring."""
+    """
+    One rated option within a session. Raw storage only — no scoring.
+
+    For a "rate every option" question, the athlete produces one row per
+    option (this row's `rating`, 1-5, is their effectiveness rating for that
+    specific option). For a "single select" question, one row exists for the
+    chosen option and `rating` is left null.
+    """
 
     __tablename__ = "assessment_responses"
-    __table_args__ = (UniqueConstraint("session_id", "question_id", name="uq_response_session_question"),)
+    __table_args__ = (
+        UniqueConstraint("session_id", "question_id", "option_id", name="uq_response_session_question_option"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     session_id: Mapped[uuid.UUID] = mapped_column(
@@ -299,6 +367,7 @@ class AssessmentResponse(Base):
     option_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("assessment_question_options.id", ondelete="CASCADE"), nullable=False
     )
+    rating: Mapped[int | None] = mapped_column(Integer, nullable=True)
     answered_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
     session: Mapped["AssessmentSession"] = relationship("AssessmentSession", back_populates="responses")

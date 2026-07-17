@@ -276,6 +276,7 @@ class QuestionCreate(BaseModel):
     question_type: str = Field(pattern="^(likert|scenario)$")
     measurement_type: str = Field(pattern="^(trait|state)$")
     tier: str = Field(pattern="^(free|elite)$")
+    response_mode: str = Field(default="single_select", pattern="^(single_select|rate_all)$")
     reverse_scored: bool = False
     sport_category_overrides: dict[str, str] | None = None
     position_overrides: dict[str, str] | None = None
@@ -291,6 +292,7 @@ class QuestionUpdate(BaseModel):
     question_type: str | None = Field(default=None, pattern="^(likert|scenario)$")
     measurement_type: str | None = Field(default=None, pattern="^(trait|state)$")
     tier: str | None = Field(default=None, pattern="^(free|elite)$")
+    response_mode: str | None = Field(default=None, pattern="^(single_select|rate_all)$")
     reverse_scored: bool | None = None
     sport_category_overrides: dict[str, str] | None = None
     position_overrides: dict[str, str] | None = None
@@ -310,6 +312,7 @@ class QuestionAdminResponse(BaseModel):
     question_type: str
     measurement_type: str
     tier: str
+    response_mode: str
     reverse_scored: bool
     sport_category_overrides: dict[str, str] | None
     position_overrides: dict[str, str] | None
@@ -343,6 +346,7 @@ class ResolvedQuestionResponse(BaseModel):
     helper_text: str | None
     question_type: str
     measurement_type: str
+    response_mode: str
     options: list[ResolvedOptionResponse]
 
 
@@ -361,11 +365,35 @@ class AssessmentSessionResponse(BaseModel):
         from_attributes = True
 
 
-class AssessmentSessionAnswerRequest(BaseModel):
+class AssessmentSessionRatingRequest(BaseModel):
+    """One question's full set of option ratings (rate-all format): option_id -> 1-5 rating."""
     question_id: uuid.UUID
-    option_id: uuid.UUID
+    ratings: dict[uuid.UUID, int] = Field(min_length=1)
 
 
 class AssessmentSessionCurrentResponse(BaseModel):
     session: AssessmentSessionResponse | None
-    answers: dict[uuid.UUID, uuid.UUID]
+    # question_id -> { option_id -> rating }
+    ratings: dict[uuid.UUID, dict[uuid.UUID, int]]
+
+
+# --- Billing (Stripe) ---
+
+class CheckoutSessionResponse(BaseModel):
+    checkout_url: str
+
+
+class PortalSessionResponse(BaseModel):
+    portal_url: str
+
+
+class BillingStatusResponse(BaseModel):
+    has_access: bool
+    plan: str | None
+    status: str | None
+    current_period_end: datetime | None
+    cancel_at_period_end: bool
+
+
+class CheckoutSessionRequest(BaseModel):
+    billing_period: str = Field(default="monthly", pattern="^(monthly|yearly)$")

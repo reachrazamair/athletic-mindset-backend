@@ -26,6 +26,7 @@ from app.models import (
     QuestionTierEnum,
     QuestionTypeEnum,
     MeasurementTypeEnum,
+    ResponseModeEnum,
     User,
 )
 from app.schemas import (
@@ -237,6 +238,7 @@ def _to_admin_response(question: AssessmentQuestion) -> QuestionAdminResponse:
         question_type=question.question_type.value,
         measurement_type=question.measurement_type.value,
         tier=question.tier.value,
+        response_mode=question.response_mode.value,
         reverse_scored=question.reverse_scored,
         sport_category_overrides=question.sport_category_overrides,
         position_overrides=question.position_overrides,
@@ -281,12 +283,13 @@ async def create_question(
     _: User = Depends(require_role("admin")),
     db: AsyncSession = Depends(get_db),
 ):
-    data = body.model_dump(exclude={"options", "question_type", "measurement_type", "tier"})
+    data = body.model_dump(exclude={"options", "question_type", "measurement_type", "tier", "response_mode"})
     question = AssessmentQuestion(
         **data,
         question_type=QuestionTypeEnum(body.question_type),
         measurement_type=MeasurementTypeEnum(body.measurement_type),
         tier=QuestionTierEnum(body.tier),
+        response_mode=ResponseModeEnum(body.response_mode),
     )
     db.add(question)
     await db.flush()
@@ -314,7 +317,9 @@ async def update_question(
     if question is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Question not found")
 
-    data = body.model_dump(exclude_unset=True, exclude={"options", "question_type", "measurement_type", "tier"})
+    data = body.model_dump(
+        exclude_unset=True, exclude={"options", "question_type", "measurement_type", "tier", "response_mode"}
+    )
     for field, value in data.items():
         setattr(question, field, value)
     if body.question_type is not None:
@@ -323,6 +328,8 @@ async def update_question(
         question.measurement_type = MeasurementTypeEnum(body.measurement_type)
     if body.tier is not None:
         question.tier = QuestionTierEnum(body.tier)
+    if body.response_mode is not None:
+        question.response_mode = ResponseModeEnum(body.response_mode)
 
     if body.options is not None:
         # Options are replaced wholesale — the editor always submits the full set.

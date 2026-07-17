@@ -54,6 +54,19 @@ class Settings(BaseSettings):
     DEEPL_API_KEY: str = ""
     DEEPL_API_URL: str = "https://api-free.deepl.com/v2/translate"
 
+    # --- Billing (Stripe) ---
+    # The Elite plan is gated behind an active Stripe subscription (Free is
+    # granted directly, no Stripe involved — see POST /billing/subscribe-free).
+    # From the Stripe dashboard: the secret key from Developers > API keys, the
+    # two recurring Prices you create on the Elite product (monthly + yearly),
+    # and the webhook secret from Developers > Webhooks once you've added an
+    # endpoint pointing at {this API}/billing/webhook. Empty in dev = billing
+    # routes will fail loudly instead of silently accepting fake payments.
+    STRIPE_SECRET_KEY: str = ""
+    STRIPE_WEBHOOK_SECRET: str = ""
+    STRIPE_PRICE_ID_MONTHLY: str = ""
+    STRIPE_PRICE_ID_YEARLY: str = ""
+
     # Tells Pydantic Settings to load from .env file
     model_config = SettingsConfigDict(
         env_file=".env",

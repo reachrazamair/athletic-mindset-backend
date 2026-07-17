@@ -1,22 +1,32 @@
 """
-SEED ASSESSMENT — load the initial 40-question bank into the database.
+SEED ASSESSMENT — load the MVP Profile question bank into the database.
 
-Run once (and re-run safely) to populate the assessment taxonomy, questions,
-and options. Mirrors seed_content.py's idempotency pattern: this is bootstrap
-data only. Once seeded, every row is a normal database record that admins
-add/edit/delete/reorder from the CMS — nothing here is read by the
-application again after the initial load.
+This is the "Athletic Mindset MVP Profile" situational-judgment battery: 9
+constructs (Self-Efficacy, Growth Mindset, Mastery Goal Orientation, Grit,
+Mental Toughness, Coachability, Team Cohesion, Emotion Regulation, Process
+Orientation), 5 scenarios each, 4 response options per scenario. Every
+question is response_mode="rate_all" — the athlete rates every option's
+effectiveness 1-5 rather than picking one (this resists faking, see the
+source document's rationale). Each option's `score` is the expert "Key"
+rating from the document; these are explicitly draft/rational keys pending
+the client's SME panel review, so admins can freely revise them later
+through the CMS with no code changes.
 
-Sport category (team/individual/combat) isn't seeded here — it's entered
-directly by the athlete as part of the assessment's own registration step,
-not an admin-curated lookup (see AM Assessment Framework v1, Section 1).
-
+Run once (and re-run safely) to populate the bank if it's empty:
     uv run python -m app.seed_assessment
+
+Force a full replace of existing content with what's defined below (used for
+this content migration, not meant to run on every startup):
+    uv run python -m app.seed_assessment --reset
+
+Sport category (team/individual/combat) and adaptive wording aren't used —
+the source document specifies these scenarios are sport-agnostic by design.
 """
 
 import asyncio
+import sys
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -29,686 +39,601 @@ from app.models import (
     AssessmentPhase,
     AssessmentQuestion,
     AssessmentQuestionOption,
+    AssessmentResponse,
+    AssessmentSession,
     ContentEntry,
     MeasurementTypeEnum,
     QuestionTierEnum,
     QuestionTypeEnum,
+    ResponseModeEnum,
 )
 
 # --- Taxonomy ---
+# One phase, one factor per construct, one dimension per factor — this
+# instrument doesn't sub-divide constructs further (unlike the prior 40-item
+# bank), so dimension mirrors factor 1:1 just to satisfy the existing
+# phase->factor->dimension->question shape without adding a schema change.
 
 PHASES = [
-    {"key": "preparation", "name": "Preparation", "order": 0},
-    {"key": "competition", "name": "Competition", "order": 1},
-    {"key": "teamwork", "name": "Teamwork", "order": 2},
+    {"key": "mental_performance", "name": "Mental Performance Profile", "order": 0},
 ]
 
 FACTORS = [
-    {"key": "grit", "name": "Grit", "phase_key": "preparation", "order": 0},
-    {"key": "workstyle", "name": "Workstyle", "phase_key": "preparation", "order": 1},
-    {"key": "coachability", "name": "Coachability", "phase_key": "preparation", "order": 2},
-    {"key": "drive", "name": "Drive", "phase_key": "competition", "order": 0},
-    {"key": "focus", "name": "Focus", "phase_key": "competition", "order": 1},
-    {"key": "mental_toughness", "name": "Mental Toughness", "phase_key": "competition", "order": 2},
-    {"key": "leadership_potential", "name": "Leadership Potential", "phase_key": "teamwork", "order": 0},
-    {"key": "team_orientation", "name": "Team Orientation", "phase_key": "teamwork", "order": 1},
-    {"key": "situational_mindsets", "name": "Situational Mindsets", "phase_key": "teamwork", "order": 2},
+    {"key": "self_efficacy", "name": "Self-Efficacy (Competitive Confidence)", "phase_key": "mental_performance", "order": 0},
+    {"key": "growth_mindset", "name": "Growth Mindset", "phase_key": "mental_performance", "order": 1},
+    {"key": "mastery_goal_orientation", "name": "Mastery Goal Orientation", "phase_key": "mental_performance", "order": 2},
+    {"key": "grit", "name": "Grit (Perseverance & Consistency of Interest)", "phase_key": "mental_performance", "order": 3},
+    {"key": "mental_toughness", "name": "Mental Toughness / Composure Under Pressure", "phase_key": "mental_performance", "order": 4},
+    {"key": "coachability", "name": "Coachability / Feedback Receptivity", "phase_key": "mental_performance", "order": 5},
+    {"key": "team_cohesion", "name": "Team Cohesion & Psychological Collectivism", "phase_key": "mental_performance", "order": 6},
+    {"key": "emotion_regulation", "name": "Emotion Regulation", "phase_key": "mental_performance", "order": 7},
+    {"key": "process_orientation", "name": "Process Orientation", "phase_key": "mental_performance", "order": 8},
 ]
 
-DIMENSIONS = [
-    {"key": "persistence", "name": "Persistence", "factor_key": "grit", "order": 0},
-    {"key": "intrinsic_motivation", "name": "Intrinsic Motivation", "factor_key": "grit", "order": 1},
-    {"key": "extrinsic_motivation", "name": "Extrinsic Motivation", "factor_key": "grit", "order": 2},
-    {"key": "engagement", "name": "Engagement", "factor_key": "grit", "order": 3},
-    {"key": "work_ethic", "name": "Work Ethic", "factor_key": "workstyle", "order": 0},
-    {"key": "growth_mindset", "name": "Growth Mindset", "factor_key": "workstyle", "order": 1},
-    {"key": "goal_orientation_practice", "name": "Goal Orientation (Practice)", "factor_key": "workstyle", "order": 2},
-    {"key": "feedback_acceptance", "name": "Feedback Acceptance", "factor_key": "coachability", "order": 0},
-    {"key": "humility", "name": "Humility", "factor_key": "coachability", "order": 1},
-    {"key": "adherence_to_direction", "name": "Adherence to Direction", "factor_key": "coachability", "order": 2},
-    {"key": "entitlement", "name": "Entitlement", "factor_key": "coachability", "order": 3},
-    {"key": "competitiveness", "name": "Competitiveness", "factor_key": "drive", "order": 0},
-    {"key": "intensity", "name": "Intensity", "factor_key": "drive", "order": 1},
-    {"key": "goal_orientation_performance", "name": "Goal Orientation (Performance)", "factor_key": "drive", "order": 2},
-    {"key": "concentration", "name": "Concentration", "factor_key": "focus", "order": 0},
-    {"key": "presence", "name": "Presence", "factor_key": "focus", "order": 1},
-    {"key": "confidence", "name": "Confidence", "factor_key": "mental_toughness", "order": 0},
-    {"key": "visualization_ability", "name": "Visualization Ability", "factor_key": "mental_toughness", "order": 1},
-    {"key": "stress_management", "name": "Stress Management", "factor_key": "mental_toughness", "order": 2},
-    {"key": "sociability", "name": "Sociability", "factor_key": "leadership_potential", "order": 0},
-    {"key": "integrity", "name": "Integrity", "factor_key": "leadership_potential", "order": 1},
-    {"key": "reliance", "name": "Reliance", "factor_key": "leadership_potential", "order": 2},
-    {"key": "team_preference", "name": "Team Preference", "factor_key": "team_orientation", "order": 0},
-    {"key": "team_goal_focused", "name": "Team Goal Focused", "factor_key": "team_orientation", "order": 1},
-    {"key": "adversity_response", "name": "Adversity Response", "factor_key": "situational_mindsets", "order": 0},
-    {"key": "big_moment_performance", "name": "Big Moment Performance", "factor_key": "situational_mindsets", "order": 1},
-    {"key": "slump_response", "name": "Slump Response", "factor_key": "situational_mindsets", "order": 2},
-    {"key": "criticism_response", "name": "Criticism Response", "factor_key": "situational_mindsets", "order": 3},
-    {"key": "teammate_conflict", "name": "Teammate Conflict", "factor_key": "situational_mindsets", "order": 4},
-]
+DIMENSIONS = [{"key": f["key"], "name": f["name"], "factor_key": f["key"], "order": 0} for f in FACTORS]
 
 
-
-def opt(label: str, text: str, score: int, tag: str) -> dict:
-    return {"label": label, "text": text, "score": score, "tag": tag, "order": ord(label) - ord("A")}
+def opt(label: str, text: str, key: int) -> dict:
+    return {"label": label, "text": text, "score": key, "tag": None, "order": ord(label) - ord("A")}
 
 
 # --- Questions ---
-# order matches the framework doc's Q1..Q40. tier/reverse_scored/question_type/
-# measurement_type all come directly from each question's header row in the doc.
+# order runs 1..45 across the whole bank (5 items per construct, in the
+# document's construct order). `score` on each option is the document's "Key"
+# value — the expert-rated effectiveness (1=Very Ineffective..5=Very
+# Effective) this option's rating is compared against.
 
 QUESTIONS = [
+    # 1. Self-Efficacy
     dict(
-        order=1, dimension_key="persistence", question_type="likert", measurement_type="trait",
-        tier="free", reverse_scored=False,
-        prompt="When I hit a wall in training — physically or mentally — I find a way to push through it.",
-        helper_text="Think about the last time practice or training got really hard.",
-        options=[
-            opt("A", "Strongly Agree — I almost never quit when things get tough.", 5, "Elite Persistence"),
-            opt("B", "Agree — I push through most of the time, with occasional setbacks.", 4, "Above Avg"),
-            opt("C", "Neutral — It depends on the day and how I'm feeling.", 3, "Average"),
-            opt("D", "Disagree — I often find reasons to ease up when it gets hard.", 2, "Below Avg"),
-            opt("E", "Strongly Disagree — I struggle to push through difficult training regularly.", 1, "Development Area"),
-        ],
-    ),
-    dict(
-        order=2, dimension_key="persistence", question_type="scenario", measurement_type="trait",
-        tier="free", reverse_scored=False,
-        prompt="You've been working on the same weakness for 6 weeks. You're not seeing results yet. What do you do?",
-        helper_text="Be honest — there's no wrong answer here.",
-        options=[
-            opt("A", "I keep going. Progress is rarely linear and I trust the process completely.", 5, "Elite Grit"),
-            opt("B", "I stay with it but start questioning my approach — maybe I need a different method.", 4, "Strong Grit"),
-            opt("C", "I take a short break and revisit it — I need to reset mentally.", 3, "Average Grit"),
-            opt("D", "I start spending less time on it and more time on things I'm already good at.", 2, "Avoidance Pattern"),
-            opt("E", "I move on. If something isn't working after 6 weeks, it's probably not for me.", 1, "Low Persistence"),
-        ],
-    ),
-    dict(
-        order=3, dimension_key="intrinsic_motivation", question_type="likert", measurement_type="trait",
-        tier="free", reverse_scored=False,
-        prompt="I would train hard even if no coach, parent, or teammate was watching.",
-        helper_text="Think about your internal drive — not what others expect of you.",
-        options=[
-            opt("A", "Strongly Agree — I train for myself, full stop.", 5, "High Intrinsic Drive"),
-            opt("B", "Agree — My internal drive is strong, though recognition helps.", 4, "Above Avg"),
-            opt("C", "Neutral — I need some external push to stay consistent.", 3, "Mixed Motivation"),
-            opt("D", "Disagree — External motivation (coaches, parents, scouts) drives most of my effort.", 2, "Extrinsic Dependent"),
-            opt("E", "Strongly Disagree — Without external pressure, I would train much less.", 1, "Low Intrinsic Drive"),
-        ],
-    ),
-    dict(
-        order=4, dimension_key="intrinsic_motivation", question_type="likert", measurement_type="state",
-        tier="free", reverse_scored=False,
-        prompt="Right now, in this moment of your season or training cycle, how motivated do you feel?",
-        helper_text="This is about TODAY — not how you usually feel.",
-        options=[
-            opt("A", "Extremely motivated — I feel locked in and hungry right now.", 5, "High State Motivation"),
-            opt("B", "Pretty motivated — I'm engaged and working hard.", 4, "Above Avg State"),
-            opt("C", "Moderately motivated — Going through the motions some days.", 3, "Average State"),
-            opt("D", "Low motivation right now — I'm grinding but not feeling it.", 2, "State Dip"),
-            opt("E", "Very low — I'm struggling to care about training at the moment.", 1, "Burnout Risk"),
-        ],
-    ),
-    dict(
-        order=5, dimension_key="extrinsic_motivation", question_type="scenario", measurement_type="trait",
-        tier="elite", reverse_scored=False,
-        prompt="Your coach tells you that a scout will be watching your next three games/matches. How does this change your preparation?",
+        order=1, dimension_key="self_efficacy", question_type="scenario", measurement_type="trait",
+        tier="free", response_mode="rate_all",
+        prompt="You're facing one of the biggest moments of your season so far, against an opponent or standard you've never beaten before. Rate each response:",
         helper_text=None,
         options=[
-            opt("A", "It doesn't change much — I prepare the same way every time regardless of who's watching.", 5, "Stable Intrinsic"),
-            opt("B", "I prepare slightly more intensely — the external motivation gives me an extra boost.", 4, "Healthy Extrinsic Use"),
-            opt("C", "I significantly ramp up preparation — this is a huge opportunity and I treat it differently.", 3, "Opportunity Responsive"),
-            opt("D", "I become anxious and my preparation gets disrupted by thinking about the scout.", 2, "Performance Anxiety Risk"),
-            opt("E", "I struggle to prepare normally — the pressure overwhelms my routine.", 1, "High Anxiety Pattern"),
-        ],
-        sport_category_overrides={
-            "individual": "Your coach tells you that a scout will be watching your next three races/matches, tracking your times/rankings closely. How does this change your preparation?",
-            "combat": "Your coach tells you that a scout will be watching your next three fights, evaluating your ranking. How does this change your preparation?",
-        },
-    ),
-    dict(
-        order=6, dimension_key="engagement", question_type="likert", measurement_type="trait",
-        tier="elite", reverse_scored=False,
-        prompt="I am fully present and mentally engaged during practice — not just going through the motions.",
-        helper_text="Be honest. Even elite athletes have days where they check out.",
-        options=[
-            opt("A", "Strongly Agree — I treat every rep in practice like it matters.", 5, "Elite Engagement"),
-            opt("B", "Agree — Most of the time I'm locked in at practice.", 4, "High Engagement"),
-            opt("C", "Neutral — My engagement varies a lot depending on what we're doing.", 3, "Inconsistent"),
-            opt("D", "Disagree — I find myself going through the motions more often than not.", 2, "Low Engagement"),
-            opt("E", "Strongly Disagree — Practice feels like something I have to get through, not something I invest in.", 1, "Disengaged"),
+            opt("A", "Tell yourself, “I've done this exact skill successfully many times in practice; I just need to execute what I know.”", 5),
+            opt("B", "Tell yourself, “I hope I don't choke like last time.”", 1),
+            opt("C", "Avoid thinking about it at all and hope your body “just knows what to do.”", 2),
+            opt("D", "Remind yourself of a specific past performance where you executed this exact skill well.", 5),
         ],
     ),
     dict(
-        order=7, dimension_key="work_ethic", question_type="scenario", measurement_type="trait",
-        tier="free", reverse_scored=False,
-        prompt="Practice is over. Your coach hasn't required anything extra. What do you actually do?",
+        order=2, dimension_key="self_efficacy", question_type="scenario", measurement_type="trait",
+        tier="free", response_mode="rate_all",
+        prompt="You haven't succeeded on your last several attempts in a competition. Your coach gives you another chance on the next big opportunity.",
         helper_text=None,
         options=[
-            opt("A", "I stay and work on specific weaknesses I identified during practice.", 5, "Elite Work Ethic"),
-            opt("B", "I do a little extra on my own — some additional reps or conditioning.", 4, "High Work Ethic"),
-            opt("C", "I head home but think about what I should be working on.", 3, "Average"),
-            opt("D", "I leave — practice is practice, rest is rest.", 2, "Minimum Effort"),
-            opt("E", "I leave as soon as possible — recovery and rest are my priority.", 1, "Low Voluntary Effort"),
+            opt("A", "Think, “I'm cooked today, someone else should take this.”", 1),
+            opt("B", "Focus on the process cues that have worked before (“balance, follow-through”) rather than the miss count.", 5),
+            opt("C", "Get angry at yourself internally to “motivate” harder effort.", 2),
+            opt("D", "Ask a teammate for a quick reset cue or word of encouragement.", 4),
         ],
-        sport_category_overrides={
-            "individual": "Training is over. No one required anything extra of you. What do you actually do?",
-            "combat": "The session is over. Your coach hasn't required any extra drilling or sparring. What do you actually do?",
-        },
     ),
     dict(
-        order=8, dimension_key="work_ethic", question_type="likert", measurement_type="trait",
-        tier="free", reverse_scored=False,
-        prompt="The effort I put into the details of my sport — film study, nutrition, sleep, recovery — is something I genuinely invest in.",
+        order=3, dimension_key="self_efficacy", question_type="scenario", measurement_type="trait",
+        tier="free", response_mode="rate_all",
+        prompt="A new training block introduces a skill/technique you've never attempted (e.g., a new team strategy, a harder skill progression).",
         helper_text=None,
         options=[
-            opt("A", "Strongly Agree — The details are where championships are made.", 5, "Elite Preparation"),
-            opt("B", "Agree — I take the details seriously, though not perfectly.", 4, "High Preparation"),
-            opt("C", "Neutral — I handle some details but not all of them consistently.", 3, "Selective"),
-            opt("D", "Disagree — I mostly focus on the physical side and less on the details.", 2, "Surface Level"),
-            opt("E", "Strongly Disagree — I don't think the details make that big a difference.", 1, "Low Detail Orientation"),
+            opt("A", "Assume you'll be bad at it since you've never done it and hold back effort to avoid embarrassment.", 1),
+            opt("B", "Break it into smaller components you can master progressively before attempting it fully.", 5),
+            opt("C", "Watch a teammate who's good at it and mentally rehearse the movement before trying.", 4),
+            opt("D", "Attempt it full-speed immediately with no lead-up, regardless of readiness.", 2),
         ],
     ),
     dict(
-        order=9, dimension_key="growth_mindset", question_type="likert", measurement_type="trait",
-        tier="free", reverse_scored=False,
-        prompt="When I fail at something in my sport, my first instinct is to figure out what I can learn from it.",
-        helper_text="Think about a recent failure or setback.",
+        order=4, dimension_key="self_efficacy", question_type="scenario", measurement_type="trait",
+        tier="free", response_mode="rate_all",
+        prompt="You're warming up before a competition and notice the opponent looks bigger/faster/more decorated than you.",
+        helper_text=None,
         options=[
-            opt("A", "Strongly Agree — Failure is data. I dissect it and move forward.", 5, "Elite Growth Mindset"),
-            opt("B", "Agree — I try to learn from failures, though it takes me some time.", 4, "Growth Oriented"),
-            opt("C", "Neutral — Sometimes I reflect, sometimes I just move on.", 3, "Mixed Mindset"),
-            opt("D", "Disagree — My first instinct is frustration and it takes a while to find the lesson.", 2, "Fixed Tendency"),
-            opt("E", "Strongly Disagree — Failure usually just makes me feel like I'm not cut out for this.", 1, "Fixed Mindset"),
+            opt("A", "Focus on your own preparation and what you specifically control (your routine, your competition plan).", 5),
+            opt("B", "Compare your stats to theirs to decide if you belong at this level.", 2),
+            opt("C", "Seek out a coach or teammate to talk through your competition plan one more time.", 4),
+            opt("D", "Let the comparison sit in your head and hope it doesn't affect you.", 1),
+        ],
+    ),
+    dict(
+        order=5, dimension_key="self_efficacy", question_type="scenario", measurement_type="trait",
+        tier="free", response_mode="rate_all",
+        prompt="After a poor individual performance in a team loss, a coach or teammate asks how you're feeling about your form heading into next week.",
+        helper_text=None,
+        options=[
+            opt("A", "Explain specifically what went wrong and what you're already fixing in practice this week.", 5),
+            opt("B", "Express doubt about whether you still have the ability to perform well.", 1),
+            opt("C", "Attribute the poor performance entirely to external conditions, not your own execution.", 2),
+            opt("D", "Give a vague answer about grinding it out without a specific plan.", 3),
+        ],
+    ),
+    # 2. Growth Mindset
+    dict(
+        order=6, dimension_key="growth_mindset", question_type="scenario", measurement_type="trait",
+        tier="free", response_mode="rate_all",
+        prompt="You get cut from an elite squad/team or lose your regular playing/competing role.",
+        helper_text=None,
+        options=[
+            opt("A", "Conclude you've hit your ceiling and this sport isn't for you.", 1),
+            opt("B", "Ask the coach specifically what to work on to be considered again.", 5),
+            opt("C", "Blame the coach's favoritism and disengage from extra training.", 1),
+            opt("D", "Increase training volume without seeking specific feedback on what to change.", 3),
+        ],
+    ),
+    dict(
+        order=7, dimension_key="growth_mindset", question_type="scenario", measurement_type="trait",
+        tier="free", response_mode="rate_all",
+        prompt="A teammate who used to be worse than you has now surpassed your skill level.",
+        helper_text=None,
+        options=[
+            opt("A", "Assume they're just “naturally gifted” and there's nothing to learn from it.", 1),
+            opt("B", "Ask them what specifically changed in their training or mindset.", 5),
+            opt("C", "Feel threatened and start avoiding training with them.", 2),
+            opt("D", "Quietly increase your own effort without addressing what's different in your approach.", 3),
+        ],
+    ),
+    dict(
+        order=8, dimension_key="growth_mindset", question_type="scenario", measurement_type="trait",
+        tier="free", response_mode="rate_all",
+        prompt="You receive harsh but specific technical feedback from a coach in front of the team.",
+        helper_text=None,
+        options=[
+            opt("A", "Shut down and assume the coach thinks you're not good enough, period.", 1),
+            opt("B", "Separate the feedback on the skill from your sense of self-worth and note the specific correction.", 5),
+            opt("C", "Get defensive and explain why the mistake wasn't really your fault.", 2),
+            opt("D", "Nod along but privately dismiss the feedback as the coach “not getting it.”", 1),
+        ],
+    ),
+    dict(
+        order=9, dimension_key="growth_mindset", question_type="scenario", measurement_type="trait",
+        tier="free", response_mode="rate_all",
+        prompt="You've plateaued on a specific performance metric you track (e.g., a time, a max effort, an accuracy rate) for several months.",
+        helper_text=None,
+        options=[
+            opt("A", "Conclude that's just your genetic ceiling for that metric.", 1),
+            opt("B", "Experiment with a new training method or seek a specialist's input.", 5),
+            opt("C", "Keep doing the exact same program, assuming consistency alone will break the plateau.", 2),
+            opt("D", "Reduce effort on that metric and focus only on things you're already good at.", 2),
         ],
     ),
     dict(
         order=10, dimension_key="growth_mindset", question_type="scenario", measurement_type="trait",
-        tier="elite", reverse_scored=False,
-        prompt="A teammate or competitor who you used to be better than has clearly surpassed you. What's your honest reaction?",
+        tier="free", response_mode="rate_all",
+        prompt="A teammate says, “I'm just not a natural at this like my sibling.”",
         helper_text=None,
         options=[
-            opt("A", "I'm genuinely motivated by it — it raises the bar for what I know I can achieve.", 5, "Elite Growth Response"),
-            opt("B", "I'm frustrated at first but quickly use it as motivation to push harder.", 4, "Healthy Competitive Growth"),
-            opt("C", "I feel a mix of inspiration and insecurity — I'm not sure how to process it.", 3, "Mixed Response"),
-            opt("D", "It bothers me more than it motivates me — I start questioning my own ability.", 2, "Threat Response"),
-            opt("E", "It makes me feel like maybe I've reached my ceiling in this sport.", 1, "Fixed Mindset Trigger"),
+            opt("A", "Agree, and suggest they try a different sport instead.", 1),
+            opt("B", "Explain that skill in this sport is built through specific, repeatable practice, and offer a concrete next step.", 5),
+            opt("C", "Tell them “everyone's a natural at something, just keep trying” with no specific plan.", 3),
+            opt("D", "Tell them talent doesn't matter at all and only hard work exists.", 2),
         ],
     ),
+    # 3. Mastery Goal Orientation
     dict(
-        order=11, dimension_key="goal_orientation_practice", question_type="likert", measurement_type="trait",
-        tier="elite", reverse_scored=False,
-        prompt="Before practice, I have a clear goal for what I want to improve or accomplish in that session.",
+        order=11, dimension_key="mastery_goal_orientation", question_type="scenario", measurement_type="trait",
+        tier="free", response_mode="rate_all",
+        prompt="You finish 2nd, with your best individual performance of the season, while the athlete who finished 1st performed below their own season best.",
         helper_text=None,
         options=[
-            opt("A", "Strongly Agree — I set specific goals before every practice.", 5, "Elite Goal Setting"),
-            opt("B", "Agree — I usually have a sense of what I want to work on.", 4, "Goal Oriented"),
-            opt("C", "Neutral — I sometimes set goals but mostly just react to what practice brings.", 3, "Reactive"),
-            opt("D", "Disagree — I mostly show up and do what the coach asks without additional personal goals.", 2, "Low Self-Direction"),
-            opt("E", "Strongly Disagree — I don't think pre-practice goal setting makes a real difference.", 1, "No Goal Orientation"),
+            opt("A", "Feel like a failure because you didn't win.", 2),
+            opt("B", "Recognize your own season-best performance as the core measure of success, and still note what to sharpen for next time.", 5),
+            opt("C", "Feel satisfied only because you beat most of the field, disregarding your own performance level.", 2),
+            opt("D", "Dismiss the result because “the competition wasn't strong enough to matter.”", 1),
         ],
     ),
     dict(
-        order=12, dimension_key="feedback_acceptance", question_type="scenario", measurement_type="trait",
-        tier="free", reverse_scored=False,
-        prompt="Your coach corrects the same mistake you've made three times in a row — loudly, in front of your teammates. Your reaction?",
-        helper_text="Be honest. This is a safe space.",
-        options=[
-            opt("A", "I listen, acknowledge it, and make the correction immediately without any defensiveness.", 5, "Elite Coachability"),
-            opt("B", "It stings a little, but I focus on fixing the mistake rather than how it was delivered.", 4, "High Coachability"),
-            opt("C", "I feel embarrassed but try not to let it affect my performance.", 3, "Average Coachability"),
-            opt("D", "I get defensive internally and it takes me a while to let it go.", 2, "Defensive Pattern"),
-            opt("E", "I shut down. Public corrections throw me off and make it hard to perform.", 1, "Low Feedback Tolerance"),
-        ],
-        sport_category_overrides={
-            "individual": "Your coach corrects the same mistake you've made three times in a row — bluntly, one-on-one. Your reaction?",
-            "combat": "Your corner corrects the same mistake you've made three times in a row — bluntly, between rounds. Your reaction?",
-        },
-    ),
-    dict(
-        order=13, dimension_key="feedback_acceptance", question_type="likert", measurement_type="trait",
-        tier="free", reverse_scored=False,
-        prompt="When a coach gives me critical feedback, I genuinely believe it's making me better — even when it's uncomfortable.",
+        order=12, dimension_key="mastery_goal_orientation", question_type="scenario", measurement_type="trait",
+        tier="free", response_mode="rate_all",
+        prompt="Preseason goal-setting: your coach asks you to set a personal target for the year.",
         helper_text=None,
         options=[
-            opt("A", "Strongly Agree — Critical feedback is the fastest path to improvement.", 5, "Elite Receptivity"),
-            opt("B", "Agree — I value critical feedback even when it's hard to hear.", 4, "High Receptivity"),
-            opt("C", "Neutral — It depends on how the feedback is delivered.", 3, "Conditional Receptivity"),
-            opt("D", "Disagree — I often feel critical feedback is more discouraging than helpful.", 2, "Low Receptivity"),
-            opt("E", "Strongly Disagree — Critical feedback usually just makes me feel attacked.", 1, "Defensive"),
+            opt("A", "Set a goal purely based on beating a specific rival.", 2),
+            opt("B", "Set a goal tied to a specific, controllable improvement in your own performance (e.g., a technical or conditioning benchmark).", 5),
+            opt("C", "Set a vague goal like “be the best” with no defined benchmark.", 2),
+            opt("D", "Set a goal solely about earning a featured role, spot, or award, regardless of the skill development behind it.", 3),
         ],
     ),
     dict(
-        order=14, dimension_key="humility", question_type="likert", measurement_type="trait",
-        tier="free", reverse_scored=True,
-        prompt="I sometimes feel like I know better than my coach about what I should be doing.",
-        helper_text="This is a reverse-scored question — honesty matters most here.",
-        options=[
-            opt("A", "Strongly Disagree — My coaches have earned my trust and I defer to their expertise.", 5, "High Humility"),
-            opt("B", "Disagree — I rarely second-guess my coach's decisions.", 4, "Above Avg Humility"),
-            opt("C", "Neutral — Sometimes I agree, sometimes I think I know better.", 3, "Average"),
-            opt("D", "Agree — I often feel my judgment about my own development is better than my coach's.", 2, "Low Humility"),
-            opt("E", "Strongly Agree — I frequently think my coach's approach is wrong for me.", 1, "Entitlement Pattern"),
-        ],
-    ),
-    dict(
-        order=15, dimension_key="humility", question_type="scenario", measurement_type="state",
-        tier="elite", reverse_scored=True,
-        prompt="You've been performing well this season. Your coach makes a decision that you strongly disagree with — one that directly affects your role. What do you do?",
+        order=13, dimension_key="mastery_goal_orientation", question_type="scenario", measurement_type="trait",
+        tier="free", response_mode="rate_all",
+        prompt="You win a competition but know your performance was sloppy and below your standard.",
         helper_text=None,
         options=[
-            opt("A", "I have a respectful private conversation with the coach, share my perspective, then fully commit to their decision.", 5, "Elite Humility + Leadership"),
-            opt("B", "I accept the decision even if I disagree — I trust the process.", 4, "High Humility"),
-            opt("C", "I privately vent to a teammate but ultimately go along with it.", 3, "Average — social processing"),
-            opt("D", "I make it clear I disagree and my performance reflects my frustration.", 2, "Low Humility"),
-            opt("E", "I become disruptive — it's hard for me to commit when I think a decision is wrong.", 1, "Entitlement / Disruptive"),
+            opt("A", "Feel fully satisfied — a win is a win.", 2),
+            opt("B", "Feel genuinely conflicted, and review film to identify what to fix despite the win.", 5),
+            opt("C", "Feel embarrassed and avoid reviewing the performance at all.", 2),
+            opt("D", "Assume the win proves no changes are needed.", 1),
         ],
-        sport_category_overrides={
-            "individual": "You've been performing well this season. Your coach makes a decision you strongly disagree with — one that directly affects your event selection or seeding. What do you do?",
-            "combat": "You've been performing well this season. Your coach makes a decision you strongly disagree with — one that directly affects your fight card placement. What do you do?",
-        },
     ),
     dict(
-        order=16, dimension_key="adherence_to_direction", question_type="likert", measurement_type="trait",
-        tier="elite", reverse_scored=False,
-        prompt="When a coach gives me a specific instruction — even if it feels counterintuitive — I follow it completely before deciding whether it works.",
+        order=14, dimension_key="mastery_goal_orientation", question_type="scenario", measurement_type="trait",
+        tier="free", response_mode="rate_all",
+        prompt="Midway through a rebuilding season where the team is losing more than winning.",
         helper_text=None,
         options=[
-            opt("A", "Strongly Agree — I give the instruction a full and honest trial before evaluating it.", 5, "High Adherence"),
-            opt("B", "Agree — I usually follow instructions closely, with occasional personal adjustments.", 4, "Above Avg"),
-            opt("C", "Neutral — I follow the spirit of instructions but sometimes modify based on feel.", 3, "Selective Adherence"),
-            opt("D", "Disagree — I adapt instructions to fit what feels natural to me.", 2, "Low Adherence"),
-            opt("E", "Strongly Disagree — I've learned what works for me and I adjust accordingly.", 1, "Resistant"),
+            opt("A", "Disengage from practice since results “don't matter” this year.", 1),
+            opt("B", "Set individual and team development targets to track versus prior weeks, independent of the win/loss record.", 5),
+            opt("C", "Focus entirely on the scoreboard and become increasingly frustrated week to week.", 2),
+            opt("D", "Blame teammates for the results and stop trying to improve your own performance.", 1),
         ],
     ),
     dict(
-        order=17, dimension_key="entitlement", question_type="scenario", measurement_type="trait",
-        tier="elite", reverse_scored=True,
-        prompt="You've had a great season. A less experienced teammate gets an opportunity you believe you earned. Your response?",
-        helper_text="There's no judgment here — this tests how you process fairness.",
-        options=[
-            opt("A", "I congratulate them genuinely and keep working — opportunities come from performance.", 5, "Low Entitlement"),
-            opt("B", "I'm disappointed internally but don't let it affect my attitude or effort.", 4, "Mature Response"),
-            opt("C", "I'm frustrated and need a day or two to process it before refocusing.", 3, "Average"),
-            opt("D", "I openly express frustration to my coach and peers — I deserve to know why.", 2, "Entitlement Pattern"),
-            opt("E", "It significantly affects my effort and attitude until I feel the situation is corrected.", 1, "High Entitlement"),
-        ],
-        sport_category_overrides={
-            "individual": "You've had a great season. A less experienced athlete gets a wild card or event selection you believe you earned. Your response?",
-            "combat": "You've had a great season. A less experienced fighter gets a fight card placement you believe you earned. Your response?",
-        },
-    ),
-    dict(
-        order=18, dimension_key="competitiveness", question_type="likert", measurement_type="trait",
-        tier="free", reverse_scored=False,
-        prompt="Losing genuinely bothers me — not in a destructive way, but in a way that drives me to compete harder next time.",
+        order=15, dimension_key="mastery_goal_orientation", question_type="scenario", measurement_type="trait",
+        tier="free", response_mode="rate_all",
+        prompt="After a tough loss, your coach asks the team what went well individually, despite the result.",
         helper_text=None,
         options=[
-            opt("A", "Strongly Agree — I hate losing more than I love winning and it fuels my training.", 5, "Elite Competitive Drive"),
-            opt("B", "Agree — I take losses seriously and they motivate me.", 4, "High Competitiveness"),
-            opt("C", "Neutral — Losing is part of sports. I process it and move forward.", 3, "Average"),
-            opt("D", "Disagree — I'm competitive in the moment but losses don't linger for me.", 2, "Low Competitive Burn"),
-            opt("E", "Strongly Disagree — Losing doesn't bother me much — I focus on how I played.", 1, "Low Competitiveness"),
+            opt("A", "Say “nothing,” since the team lost.", 2),
+            opt("B", "Identify one or two specific things you personally executed better than in past competitions.", 5),
+            opt("C", "Deflect and only critique teammates' performances.", 1),
+            opt("D", "Say generic things like “we tried hard” without specifics.", 3),
         ],
     ),
+    # 4. Grit
     dict(
-        order=19, dimension_key="competitiveness", question_type="scenario", measurement_type="state",
-        tier="free", reverse_scored=False,
-        prompt="You are down at halftime / halfway through the match / between rounds. What happens inside you?",
-        helper_text="Pick the answer that most honestly describes your internal experience.",
-        options=[
-            opt("A", "I get more focused and locked in — being down activates something in me.", 5, "Clutch Response"),
-            opt("B", "I stay calm and remind myself there's plenty of time / rounds left.", 4, "Composed Competitor"),
-            opt("C", "I feel pressure but try to stay positive and keep competing.", 3, "Average Competitive State"),
-            opt("D", "I start to worry about whether we can come back / whether I can win.", 2, "Anxiety in Deficit"),
-            opt("E", "Being down significantly affects my performance — I struggle to find my game.", 1, "Deficit Shutdown"),
-        ],
-        sport_category_overrides={
-            "team": "You are down at halftime. What happens inside you?",
-            "individual": "You are down halfway through the race, or behind by a set or a few holes. What happens inside you?",
-            "combat": "You are down on the scorecards between rounds. What happens inside you?",
-        },
-    ),
-    dict(
-        order=20, dimension_key="intensity", question_type="likert", measurement_type="trait",
-        tier="elite", reverse_scored=False,
-        prompt="I bring an intensity and energy to competition that teammates, coaches, or opponents can feel.",
-        helper_text="Not arrogance — genuine competitive energy.",
-        options=[
-            opt("A", "Strongly Agree — People know when I'm locked in. My energy changes the environment.", 5, "Elite Intensity"),
-            opt("B", "Agree — I bring strong energy, especially in big moments.", 4, "High Intensity"),
-            opt("C", "Neutral — My intensity is steady but not particularly contagious.", 3, "Average"),
-            opt("D", "Disagree — I compete internally but don't outwardly project much intensity.", 2, "Internal Only"),
-            opt("E", "Strongly Disagree — I perform best when I stay calm and low-key.", 1, "Low External Intensity"),
-        ],
-    ),
-    dict(
-        order=21, dimension_key="goal_orientation_performance", question_type="scenario", measurement_type="trait",
-        tier="elite", reverse_scored=False,
-        prompt="Before a competition, what is your primary focus?",
-        helper_text="Choose what's most true — not what sounds best.",
-        options=[
-            opt("A", "Executing my process — the result will take care of itself if I do my job.", 5, "Process Mastery"),
-            opt("B", "Winning — I want to beat the opponent in front of me.", 4, "Performance Goal"),
-            opt("C", "My personal stats and performance metrics.", 3, "Ego Goal"),
-            opt("D", "Not making mistakes that cost the team.", 2, "Avoidance Orientation"),
-            opt("E", "Just getting through it without embarrassing myself.", 1, "Fear-Based Orientation"),
-        ],
-    ),
-    dict(
-        order=22, dimension_key="concentration", question_type="scenario", measurement_type="trait",
-        tier="free", reverse_scored=False,
-        prompt="It's the most critical moment of the game/match/race. The crowd is loud, the stakes are high. Where is your mind?",
+        order=16, dimension_key="grit", question_type="scenario", measurement_type="trait",
+        tier="free", response_mode="rate_all",
+        prompt="You're many months into recovering from a significant injury, with no guarantee you'll return to your prior level.",
         helper_text=None,
         options=[
-            opt("A", "100% on the task — external noise literally disappears for me in these moments.", 5, "Elite Focus"),
-            opt("B", "Mostly on the task — I'm aware of the environment but it doesn't distract me.", 4, "High Focus"),
-            opt("C", "I'm focused but the environment creeps in and I have to actively manage it.", 3, "Average Focus"),
-            opt("D", "The environment significantly affects my concentration in high-stakes moments.", 2, "Focus Vulnerable"),
-            opt("E", "High-stakes moments actually make it harder for me to concentrate.", 1, "Pressure Focus Collapse"),
-        ],
-        position_overrides={
-            "Quarterback": "It's the two-minute drill, the crowd is deafening, and the defense is disguising its look. Where is your mind?",
-            "Goalkeeper": "It's a breakaway or a penalty shot with the game on the line and the crowd roaring. Where is your mind?",
-            "Pitcher": "Bases loaded, full count, the game on the line. Where is your mind?",
-        },
-    ),
-    dict(
-        order=23, dimension_key="concentration", question_type="likert", measurement_type="trait",
-        tier="elite", reverse_scored=False,
-        prompt="After making a mistake during competition, I refocus quickly without letting it affect my next play/action.",
-        helper_text="The ability to reset is one of the most critical mental skills in sport.",
-        options=[
-            opt("A", "Strongly Agree — I have a reset routine and it works. Mistakes don't linger.", 5, "Elite Reset Ability"),
-            opt("B", "Agree — I recover fairly quickly, usually within a play or two.", 4, "High Reset"),
-            opt("C", "Neutral — It depends on the mistake and how big the moment is.", 3, "Contextual Reset"),
-            opt("D", "Disagree — Mistakes stay with me longer than I'd like during competition.", 2, "Slow Reset"),
-            opt("E", "Strongly Disagree — One bad play or moment can unravel my whole performance.", 1, "Error Snowball Pattern"),
+            opt("A", "Quit the sport since the outcome is uncertain.", 1),
+            opt("B", "Keep a long-term target while adjusting the daily plan based on what the body allows.", 5),
+            opt("C", "Push through every session regardless of medical guidance to “prove toughness.”", 2),
+            opt("D", "Do the rehab inconsistently, only when motivated.", 2),
         ],
     ),
     dict(
-        order=24, dimension_key="presence", question_type="likert", measurement_type="trait",
-        tier="free", reverse_scored=False,
-        prompt="During competition, I am able to stay in the current moment rather than thinking about past mistakes or future outcomes.",
-        helper_text="Present-moment awareness is one of the core findings from flow state research (Csikszentmihalyi).",
-        options=[
-            opt("A", "Strongly Agree — I live in the current play/moment during competition.", 5, "Elite Presence"),
-            opt("B", "Agree — I stay present most of the time.", 4, "High Presence"),
-            opt("C", "Neutral — My mind wanders between past and future sometimes.", 3, "Average Presence"),
-            opt("D", "Disagree — I often find myself thinking about past mistakes or future scenarios mid-competition.", 2, "Low Presence"),
-            opt("E", "Strongly Disagree — Past mistakes and future worries significantly occupy my mind during competition.", 1, "Rumination Pattern"),
-        ],
-    ),
-    dict(
-        order=25, dimension_key="presence", question_type="scenario", measurement_type="state",
-        tier="elite", reverse_scored=False,
-        prompt="Think about your LAST competition. How present were you throughout it?",
-        helper_text="This measures your current state, not your general tendency.",
-        options=[
-            opt("A", "Completely present — I was in a flow state for most of it.", 5, "Recent Flow State"),
-            opt("B", "Mostly present — I had some mental wandering but stayed competitive.", 4, "High State Presence"),
-            opt("C", "Somewhat present — I had periods of distraction that I had to manage.", 3, "Mixed State"),
-            opt("D", "Frequently distracted — I was in my head for a lot of the competition.", 2, "Low State Presence"),
-            opt("E", "Barely present — I was going through the motions mentally.", 1, "Disengaged State"),
-        ],
-    ),
-    dict(
-        order=26, dimension_key="confidence", question_type="likert", measurement_type="trait",
-        tier="free", reverse_scored=False,
-        prompt="When the game is on the line, I WANT to be the one who has to make the play.",
-        helper_text="Think about the biggest moments in your athletic career.",
-        options=[
-            opt("A", "Strongly Agree — Big moments are what I train for. Give me the ball.", 5, "Clutch Confidence"),
-            opt("B", "Agree — I welcome big moments, though I feel the pressure.", 4, "High Confidence"),
-            opt("C", "Neutral — I'm okay in big moments but don't specifically seek them out.", 3, "Average Confidence"),
-            opt("D", "Disagree — I prefer not to be in the spotlight when it's on the line.", 2, "Pressure Avoidance"),
-            opt("E", "Strongly Disagree — High-pressure moments are where I struggle most.", 1, "Pressure Vulnerability"),
-        ],
-    ),
-    dict(
-        order=27, dimension_key="confidence", question_type="likert", measurement_type="state",
-        tier="free", reverse_scored=False,
-        prompt="Right now, how confident do you feel in your ability to perform at your highest level?",
-        helper_text="This is a snapshot of TODAY — not your usual level of confidence.",
-        options=[
-            opt("A", "Extremely confident — I feel unbeatable right now.", 5, "Peak Confidence State"),
-            opt("B", "Confident — I trust my preparation and abilities.", 4, "High State Confidence"),
-            opt("C", "Moderately confident — I have some doubts but mostly believe in myself.", 3, "Average State"),
-            opt("D", "Low confidence right now — I'm second-guessing myself a lot.", 2, "Confidence Dip"),
-            opt("E", "Very low — I'm struggling to believe in my ability at the moment.", 1, "Confidence Crisis"),
-        ],
-    ),
-    dict(
-        order=28, dimension_key="visualization_ability", question_type="likert", measurement_type="trait",
-        tier="elite", reverse_scored=False,
-        prompt="I use mental imagery before competition — vividly picturing myself executing at my best — as part of my regular preparation.",
-        helper_text="Visualization is one of the 6 core mental skills (Bell, Orlick, Vealey).",
-        options=[
-            opt("A", "Strongly Agree — Mental rehearsal is a consistent, detailed part of my prep.", 5, "Elite Visualization"),
-            opt("B", "Agree — I visualize, though not as consistently or vividly as I could.", 4, "Above Avg"),
-            opt("C", "Neutral — I've tried it but I'm not sure how effective it is for me.", 3, "Emerging Skill"),
-            opt("D", "Disagree — I rarely use visualization as a preparation tool.", 2, "Underdeveloped"),
-            opt("E", "Strongly Disagree — I don't think visualization helps me perform better.", 1, "Visualization Skeptic"),
-        ],
-    ),
-    dict(
-        order=29, dimension_key="visualization_ability", question_type="scenario", measurement_type="state",
-        tier="elite", reverse_scored=False,
-        prompt="Close your eyes for 10 seconds and picture yourself executing perfectly in your next competition. What happens?",
-        helper_text="Describe your experience:",
-        options=[
-            opt("A", "I see it clearly and vividly — the environment, my body, the execution.", 5, "Elite Imagery Vividness"),
-            opt("B", "I get a fairly clear picture but some details are fuzzy.", 4, "High Imagery"),
-            opt("C", "I can picture it somewhat, but it's more conceptual than vivid.", 3, "Moderate Imagery"),
-            opt("D", "I struggle to maintain a clear mental picture.", 2, "Low Imagery"),
-            opt("E", "I don't really see anything — mental imagery is difficult for me.", 1, "Imagery Deficit"),
-        ],
-        position_overrides={
-            "Quarterback": "Close your eyes for 10 seconds and picture yourself calling and executing the winning play. What happens?",
-            "Goalkeeper": "Close your eyes for 10 seconds and picture yourself making the diving save that wins the game. What happens?",
-            "Pitcher": "Close your eyes for 10 seconds and picture yourself throwing the exact pitch you want, right where you want it. What happens?",
-        },
-    ),
-    dict(
-        order=30, dimension_key="stress_management", question_type="scenario", measurement_type="trait",
-        tier="free", reverse_scored=False,
-        prompt="In the hours before a major competition, how do you experience and manage pre-competition nerves?",
+        order=17, dimension_key="grit", question_type="scenario", measurement_type="trait",
+        tier="free", response_mode="rate_all",
+        prompt="A new, flashier sport/training trend is attracting your training partners, while your event/position feels repetitive.",
         helper_text=None,
         options=[
-            opt("A", "I channel nerves as energy — they make me sharper and more focused.", 5, "Elite Arousal Control"),
-            opt("B", "I have nerves but they don't interfere — I've learned to manage them.", 4, "High Stress Management"),
-            opt("C", "I feel significant nerves and manage them with varying success.", 3, "Average"),
-            opt("D", "Pre-competition nerves often hurt my early performance.", 2, "Anxiety Vulnerability"),
-            opt("E", "Pre-competition anxiety is one of my biggest performance challenges.", 1, "High Pre-Comp Anxiety"),
+            opt("A", "Switch focus areas frequently, chasing whatever feels novel.", 2),
+            opt("B", "Stay committed to your core event/role while finding new ways to make training engaging.", 5),
+            opt("C", "Keep grinding the same routine with zero variation, tolerating boredom rather than addressing it.", 3),
+            opt("D", "Quit your role because it's “not exciting anymore.”", 1),
         ],
-        sport_category_overrides={
-            "individual": "In the hours before a big race or match, how do you experience and manage pre-competition nerves?",
-            "combat": "In the hours before a fight, how do you experience and manage pre-fight nerves?",
-        },
     ),
     dict(
-        order=31, dimension_key="sociability", question_type="likert", measurement_type="trait",
-        tier="free", reverse_scored=False,
-        prompt="I naturally build strong relationships with teammates and coaches — people are drawn to me as a teammate.",
+        order=18, dimension_key="grit", question_type="scenario", measurement_type="trait",
+        tier="free", response_mode="rate_all",
+        prompt="You've had three consecutive losing seasons in a program that's rebuilding.",
         helper_text=None,
         options=[
-            opt("A", "Strongly Agree — I'm a connector. People trust me and come to me.", 5, "Elite Sociability"),
-            opt("B", "Agree — I build good relationships, though it takes me some time.", 4, "High Sociability"),
-            opt("C", "Neutral — I'm friendly but not particularly a social leader.", 3, "Average"),
-            opt("D", "Disagree — I prefer to let my performance speak and don't seek deep relationships.", 2, "Reserved"),
-            opt("E", "Strongly Disagree — I keep to myself and find team social dynamics draining.", 1, "Lone Wolf Pattern"),
+            opt("A", "Quit the team immediately at the first sign of adversity.", 2),
+            opt("B", "Reassess whether the long-term goal is still worth pursuing here, and if so, recommit with a clear plan.", 5),
+            opt("C", "Stay only out of obligation, with no real reinvestment of effort.", 2),
+            opt("D", "Blame the program publicly and check out mentally while still nominally on the roster.", 1),
         ],
-        sport_category_overrides={
-            "individual": "I naturally build strong relationships with my training partners and coaches — people are drawn to me.",
-            "combat": "I naturally build strong relationships with my team and corner — people are drawn to me.",
-        },
     ),
     dict(
-        order=32, dimension_key="integrity", question_type="scenario", measurement_type="trait",
-        tier="elite", reverse_scored=False,
-        prompt="A teammate is doing something that violates team rules when no coach is around. What do you do?",
+        order=19, dimension_key="grit", question_type="scenario", measurement_type="trait",
+        tier="free", response_mode="rate_all",
+        prompt="Off-season training is unglamorous, unsupervised, and results won't show for months.",
         helper_text=None,
         options=[
-            opt("A", "I address it directly with the teammate — I hold the standard even when it's uncomfortable.", 5, "Elite Integrity"),
-            opt("B", "I tell them I'm not comfortable with it and ask them to stop.", 4, "High Integrity"),
-            opt("C", "I remove myself from the situation but don't say anything.", 3, "Passive Integrity"),
-            opt("D", "I go along with it to avoid conflict — it's not my place to police teammates.", 2, "Social Compliance"),
-            opt("E", "I participate — if everyone's doing it, the group norm matters more.", 1, "Low Integrity"),
+            opt("A", "Skip most sessions since no one is watching.", 1),
+            opt("B", "Maintain a consistent training log/plan tied to your season-long goal, even without external accountability.", 5),
+            opt("C", "Train hard only right before season starts.", 2),
+            opt("D", "Set your training schedule based on daily mood.", 2),
         ],
     ),
     dict(
-        order=33, dimension_key="reliance", question_type="likert", measurement_type="trait",
-        tier="elite", reverse_scored=False,
-        prompt="My teammates know that when I say I'll do something, it gets done.",
+        order=20, dimension_key="grit", question_type="scenario", measurement_type="trait",
+        tier="free", response_mode="rate_all",
+        prompt="You experience a significant setback (major loss, injury, being benched) right before a goal you've pursued for years.",
         helper_text=None,
         options=[
-            opt("A", "Strongly Agree — I'm the person people count on. I never leave commitments unmet.", 5, "Elite Reliability"),
-            opt("B", "Agree — I follow through consistently, with rare exceptions.", 4, "High Reliability"),
-            opt("C", "Neutral — I intend to follow through but sometimes fall short.", 3, "Average"),
-            opt("D", "Disagree — I struggle with consistency in follow-through.", 2, "Low Reliability"),
-            opt("E", "Strongly Disagree — I'm better at being in the moment than following through on commitments.", 1, "Unreliable Pattern"),
+            opt("A", "Treat the setback as proof the multi-year goal was never realistic and abandon it.", 1),
+            opt("B", "Accept the setback, then adjust the timeline or approach while keeping the underlying goal.", 5),
+            opt("C", "Ignore the setback entirely and pretend nothing happened.", 2),
+            opt("D", "Rehash the setback repeatedly without adjusting any plan.", 2),
         ],
     ),
+    # 5. Mental Toughness / Composure Under Pressure
     dict(
-        order=34, dimension_key="team_preference", question_type="likert", measurement_type="trait",
-        tier="free", reverse_scored=False,
-        prompt="I perform better and feel more motivated when my success contributes to a team outcome.",
+        order=21, dimension_key="mental_toughness", question_type="scenario", measurement_type="trait",
+        tier="free", response_mode="rate_all",
+        prompt="You make a costly error late in a close competition with the outcome still in doubt.",
         helper_text=None,
         options=[
-            opt("A", "Strongly Agree — Team wins mean more to me than individual achievements.", 5, "High Team Preference"),
-            opt("B", "Agree — I love winning together, though individual achievement also drives me.", 4, "Team Oriented"),
-            opt("C", "Neutral — I value both team and individual outcomes equally.", 3, "Balanced"),
-            opt("D", "Disagree — Individual achievement motivates me more than team outcomes.", 2, "Individual Preference"),
-            opt("E", "Strongly Disagree — I perform best when competing for myself.", 1, "Individual Only"),
+            opt("A", "Dwell on the error while the play/point continues, missing your next assignment.", 1),
+            opt("B", "Use a quick reset routine (breath, cue word) and refocus on the very next action.", 5),
+            opt("C", "Play more cautiously the rest of the competition to avoid another mistake.", 2),
+            opt("D", "Confront yourself harshly to “lock in,” even if it disrupts your next play or point.", 2),
         ],
-        sport_category_overrides={
-            "individual": "I perform better and feel more motivated when my success contributes to my training group or relay team's outcome.",
-            "combat": "I perform better and feel more motivated when my success contributes to my team or camp's outcome.",
-        },
     ),
     dict(
-        order=35, dimension_key="team_goal_focused", question_type="scenario", measurement_type="trait",
-        tier="elite", reverse_scored=False,
-        prompt="Your individual performance is outstanding but the team is struggling. Your coach asks you to change your role to help the team — it will likely hurt your personal stats. What's your response?",
+        order=22, dimension_key="mental_toughness", question_type="scenario", measurement_type="trait",
+        tier="free", response_mode="rate_all",
+        prompt="The crowd/environment turns hostile (booing, heckling, unfavorable officiating) during competition.",
         helper_text=None,
         options=[
-            opt("A", "No hesitation — team first, always. I make the change immediately.", 5, "Elite Team Focus"),
-            opt("B", "I commit to it even though it's frustrating. The team comes first.", 4, "High Team Focus"),
-            opt("C", "I agree but struggle internally with the impact on my individual performance.", 3, "Team Leaning"),
-            opt("D", "I'd want to discuss it with the coach — I think my individual performance helps the team more.", 2, "Individual Leaning"),
-            opt("E", "I resist. My individual performance is my biggest contribution to the team.", 1, "Individual Priority"),
+            opt("A", "Engage verbally with the crowd/officials to defend yourself.", 1),
+            opt("B", "Narrow your attention to task-relevant cues and ignore crowd noise.", 5),
+            opt("C", "Let frustration build silently, affecting your body language and focus.", 2),
+            opt("D", "Ask a teammate/coach for a quick word to refocus in the moment.", 4),
         ],
-        sport_category_overrides={
-            "individual": "Your individual performance is outstanding, but your coach asks you to adjust your training style or event focus to better support your training group — it will likely cost you some personal results. What's your response?",
-            "combat": "Your individual performance is outstanding, but your corner asks you to follow a fight strategy that conflicts with your natural style, for the good of the long-term game plan. What's your response?",
-        },
     ),
     dict(
-        order=36, dimension_key="adversity_response", question_type="scenario", measurement_type="state",
-        tier="free", reverse_scored=False,
-        prompt="Your team is down by 3 with 5 minutes left / You're down a set / You lost the first two rounds. What do you actually feel and do?",
-        helper_text="This is a situational mindset question — it captures how you respond in adversity, not how you think you should respond.",
-        options=[
-            opt("A", "I get completely locked in — adversity is where I'm at my best.", 5, "Adversity Activated"),
-            opt("B", "I feel pressure but use it productively — it sharpens me.", 4, "Pressure Converter"),
-            opt("C", "I stay calm and keep competing — results take care of themselves.", 3, "Composed"),
-            opt("D", "I feel the weight of the situation and it affects my play.", 2, "Pressure Affected"),
-            opt("E", "Deficit situations are where I struggle most — it's hard to reset.", 1, "Adversity Shutdown"),
-        ],
-        sport_category_overrides={
-            "team": "Your team is down by a few points/goals with 5 minutes left. What do you actually feel and do?",
-            "individual": "You're down a set, or well behind in the race with laps to go. What do you actually feel and do?",
-            "combat": "You lost the first two rounds on the scorecards. What do you actually feel and do?",
-        },
-    ),
-    dict(
-        order=37, dimension_key="big_moment_performance", question_type="scenario", measurement_type="state",
-        tier="free", reverse_scored=False,
-        prompt="The biggest moment of the game is here — the final drive, the penalty kick, the championship round. Your honest experience?",
+        order=23, dimension_key="mental_toughness", question_type="scenario", measurement_type="trait",
+        tier="free", response_mode="rate_all",
+        prompt="In sudden-death or a final decisive moment, your heart rate spikes and hands are shaking.",
         helper_text=None,
         options=[
-            opt("A", "I feel totally alive. This is exactly what I train for and I perform my best.", 5, "Clutch Performer"),
-            opt("B", "I feel the weight of the moment but rise to it most of the time.", 4, "Pressure Riser"),
-            opt("C", "I give everything I have — results vary but my effort is always there.", 3, "Effort Consistent"),
-            opt("D", "Big moments tend to expose my weaknesses — I want to perform but often fall short.", 2, "Choke Tendency"),
-            opt("E", "Big moments are where I'm at my worst. The pressure gets to me.", 1, "Pressure Collapse"),
-        ],
-        sport_category_overrides={
-            "individual": "The biggest moment is here — the final hole, the final heat, the championship match point. Your honest experience?",
-            "combat": "The biggest moment is here — the championship round. Your honest experience?",
-        },
-        position_overrides={
-            "Quarterback": "It's the final drive of the championship game, two minutes on the clock. Your honest experience?",
-            "Goalkeeper": "It's a penalty kick to decide the championship. Your honest experience?",
-        },
-    ),
-    dict(
-        order=38, dimension_key="slump_response", question_type="scenario", measurement_type="state",
-        tier="elite", reverse_scored=False,
-        prompt="You've been in a performance slump for 2–3 weeks. Nothing you try seems to be working. What defines your response?",
-        helper_text=None,
-        options=[
-            opt("A", "I go back to basics, trust my process, and maintain belief — slumps are part of sport.", 5, "Resilient Slump Response"),
-            opt("B", "I seek help — coaches, mentors, film — and actively work the problem.", 4, "Problem-Solving Response"),
-            opt("C", "I train harder and hope volume fixes it.", 3, "Effort Response"),
-            opt("D", "I start questioning my fundamentals and get caught in analysis paralysis.", 2, "Overthinking Pattern"),
-            opt("E", "Slumps spiral for me — they affect my confidence in other areas of my life.", 1, "Slump Contagion"),
+            opt("A", "Interpret the energy as a sign you're not ready and start to panic.", 1),
+            opt("B", "Use a pre-performance routine to channel the energy into focused readiness.", 5),
+            opt("C", "Try to suppress all feeling and “go numb.”", 2),
+            opt("D", "Rush the action to get it over with as fast as possible.", 2),
         ],
     ),
     dict(
-        order=39, dimension_key="criticism_response", question_type="scenario", measurement_type="state",
-        tier="elite", reverse_scored=False,
-        prompt="Critics — fans, media, or social media — are publicly questioning your ability or worth. How does it affect you?",
+        order=24, dimension_key="mental_toughness", question_type="scenario", measurement_type="trait",
+        tier="free", response_mode="rate_all",
+        prompt="A close opponent begins trash-talking to get under your skin.",
         helper_text=None,
         options=[
-            opt("A", "It doesn't get in. I know who I am and what I'm capable of.", 5, "Unaffected"),
-            opt("B", "I notice it but use it as fuel rather than letting it diminish me.", 4, "Fuel Response"),
-            opt("C", "It bothers me temporarily but I compartmentalize it when competing.", 3, "Managed Impact"),
-            opt("D", "External criticism significantly affects my confidence and focus.", 2, "External Dependency"),
-            opt("E", "Public criticism can unravel my performance for extended periods.", 1, "High External Vulnerability"),
+            opt("A", "Respond in kind to “not back down.”", 1),
+            opt("B", "Stay focused on your own competition plan and let your performance respond instead.", 5),
+            opt("C", "Withdraw effort to avoid further confrontation.", 2),
+            opt("D", "Report it to an official/coach and continue competing your way.", 4),
         ],
-        sport_category_overrides={
-            "individual": "Critics — fans, media, or social media — are publicly questioning your ability. How does it affect you?",
-            "combat": "Doubters are publicly questioning whether you belong in the ring/cage before a big fight. How does it affect you?",
-        },
     ),
     dict(
-        order=40, dimension_key="teammate_conflict", question_type="scenario", measurement_type="trait",
-        tier="elite", reverse_scored=False,
-        prompt="There's real tension between you and a key teammate — unresolved conflict that's affecting both of you. How do you handle it?",
+        order=25, dimension_key="mental_toughness", question_type="scenario", measurement_type="trait",
+        tier="free", response_mode="rate_all",
+        prompt="You're leading late, and the opponent mounts a comeback, shifting momentum.",
         helper_text=None,
         options=[
-            opt("A", "I initiate a direct, respectful conversation. Unresolved conflict costs the team.", 5, "Conflict Leadership"),
-            opt("B", "I give it space to cool down and then address it privately.", 4, "Mature Conflict Handling"),
-            opt("C", "I focus on my own performance and hope it resolves itself.", 3, "Avoidance — Passive"),
-            opt("D", "I vent to other teammates — I need to process it before addressing it.", 2, "Social Processing — Risk"),
-            opt("E", "Conflict with teammates significantly affects my performance until it's resolved.", 1, "Conflict Vulnerable"),
+            opt("A", "Start playing not to lose, becoming overly conservative.", 2),
+            opt("B", "Maintain the same aggressive approach and process that built the lead.", 5),
+            opt("C", "Panic and abandon the game plan entirely.", 1),
+            opt("D", "Get frustrated at teammates for “letting up.”", 1),
         ],
-        sport_category_overrides={
-            "individual": "There's real tension between you and your training partner or coach — unresolved conflict that's affecting both of you. How do you handle it?",
-            "combat": "There's real tension between you and someone in your corner — unresolved conflict that's affecting both of you. How do you handle it?",
-        },
+    ),
+    # 6. Coachability / Feedback Receptivity
+    dict(
+        order=26, dimension_key="coachability", question_type="scenario", measurement_type="trait",
+        tier="free", response_mode="rate_all",
+        prompt="A coach gives you a technical correction you privately disagree with.",
+        helper_text=None,
+        options=[
+            opt("A", "Ignore the instruction and keep doing it your way in games.", 1),
+            opt("B", "Try the correction in practice with genuine effort before forming a final opinion.", 5),
+            opt("C", "Comply only when the coach is watching.", 2),
+            opt("D", "Argue the point extensively in the moment during a live session.", 2),
+        ],
+    ),
+    dict(
+        order=27, dimension_key="coachability", question_type="scenario", measurement_type="trait",
+        tier="free", response_mode="rate_all",
+        prompt="You want to know why you're not getting more playing time.",
+        helper_text=None,
+        options=[
+            opt("A", "Assume it's political and stop putting in extra effort.", 1),
+            opt("B", "Ask the coach directly and specifically what to improve to earn more time.", 5),
+            opt("C", "Complain to teammates instead of addressing it directly.", 1),
+            opt("D", "Wait silently, hoping the coach notices your effort eventually.", 2),
+        ],
+    ),
+    dict(
+        order=28, dimension_key="coachability", question_type="scenario", measurement_type="trait",
+        tier="free", response_mode="rate_all",
+        prompt="After review, a coach points out the same technical flaw for the third week in a row.",
+        helper_text=None,
+        options=[
+            opt("A", "Get defensive since you feel you're already trying.", 2),
+            opt("B", "Ask for a specific drill or cue to target that exact flaw.", 5),
+            opt("C", "Nod but make no behavior change in the next session.", 1),
+            opt("D", "Ask a teammate to relay to the coach that you're already working on it.", 2),
+        ],
+    ),
+    dict(
+        order=29, dimension_key="coachability", question_type="scenario", measurement_type="trait",
+        tier="free", response_mode="rate_all",
+        prompt="A younger or less-experienced coach gives you feedback that challenges how you've always done things.",
+        helper_text=None,
+        options=[
+            opt("A", "Dismiss it because of the coach's relative experience level.", 1),
+            opt("B", "Evaluate the content of the feedback on its merits, regardless of who delivered it.", 5),
+            opt("C", "Comply outwardly while privately disregarding it.", 2),
+            opt("D", "Ask clarifying questions to understand the reasoning behind the feedback.", 4),
+        ],
+    ),
+    dict(
+        order=30, dimension_key="coachability", question_type="scenario", measurement_type="trait",
+        tier="free", response_mode="rate_all",
+        prompt="You disagree strongly with a tactical decision (role change, event change, position switch) made by the coaching staff.",
+        helper_text=None,
+        options=[
+            opt("A", "Publicly express frustration to teammates before addressing the coach.", 1),
+            opt("B", "Request a private conversation to understand the reasoning and share your perspective.", 5),
+            opt("C", "Comply silently while resenting the decision and disengaging effort.", 2),
+            opt("D", "Refuse the assignment until it's changed.", 1),
+        ],
+    ),
+    # 7. Team Cohesion & Psychological Collectivism (each item probes a named facet)
+    dict(
+        order=31, dimension_key="team_cohesion", question_type="scenario", measurement_type="trait",
+        tier="free", response_mode="rate_all",
+        prompt="A new stat/highlight-tracking system starts publicizing individual performance metrics.",
+        helper_text="Goal Priority facet",
+        options=[
+            opt("A", "Adjust your play style to maximize your personal stats even if it hurts team success.", 1),
+            opt("B", "Keep prioritizing the team's tactical needs, using the stats as one input among many.", 5),
+            opt("C", "Ignore the system completely and refuse engagement with any performance data.", 3),
+            opt("D", "Pressure teammates to help you to boost your numbers.", 1),
+        ],
+    ),
+    dict(
+        order=32, dimension_key="team_cohesion", question_type="scenario", measurement_type="trait",
+        tier="free", response_mode="rate_all",
+        prompt="A play/strategy calls for you to trust a teammate to cover a task or space while you focus on your own assignment.",
+        helper_text="Reliance facet",
+        options=[
+            opt("A", "Try to cover both your assignment and theirs yourself, “just in case.”", 2),
+            opt("B", "Trust your teammate to execute their part and fully commit to your own assignment.", 5),
+            opt("C", "Skip your own assignment to double-check theirs, disrupting the team's plan.", 1),
+            opt("D", "Do your assignment half-heartedly since you're unsure they'll do theirs.", 2),
+        ],
+    ),
+    dict(
+        order=33, dimension_key="team_cohesion", question_type="scenario", measurement_type="trait",
+        tier="free", response_mode="rate_all",
+        prompt="A teammate is struggling and it's affecting overall team performance.",
+        helper_text="Concern facet",
+        options=[
+            opt("A", "Publicly criticize them to the group.", 1),
+            opt("B", "Offer specific, private support or ask what they need from the group.", 5),
+            opt("C", "Avoid the topic entirely to prevent awkwardness.", 2),
+            opt("D", "Complain to other teammates about the struggling player, not the player themselves.", 1),
+        ],
+    ),
+    dict(
+        order=34, dimension_key="team_cohesion", question_type="scenario", measurement_type="trait",
+        tier="free", response_mode="rate_all",
+        prompt="A role change would help the team but reduce your individual spotlight (e.g., moving from a role focused on individual recognition to one focused on supporting teammates).",
+        helper_text="Preference facet",
+        options=[
+            opt("A", "Resist the change and lobby to keep your old role regardless of team fit.", 1),
+            opt("B", "Accept the role change and ask how to excel within it.", 5),
+            opt("C", "Accept outwardly, but visibly sulk or under-invest in the new role.", 1),
+            opt("D", "Accept but continue trying to play the old role during competition anyway.", 1),
+        ],
+    ),
+    dict(
+        order=35, dimension_key="team_cohesion", question_type="scenario", measurement_type="trait",
+        tier="free", response_mode="rate_all",
+        prompt="Your team has a long-standing tradition or routine (a specific warm-up, a pregame ritual, a way film review is run) that you personally find pointless or would rather skip.",
+        helper_text="Norm Acceptance facet",
+        options=[
+            opt("A", "Skip it quietly whenever you think it doesn't matter.", 1),
+            opt("B", "Participate fully, since it matters to team culture even if you wouldn't have chosen it yourself.", 5),
+            opt("C", "Go along with it but complain about it to teammates.", 2),
+            opt("D", "Openly push to eliminate it before understanding why the team values it.", 2),
+        ],
+    ),
+    # 8. Emotion Regulation
+    dict(
+        order=36, dimension_key="emotion_regulation", question_type="scenario", measurement_type="trait",
+        tier="free", response_mode="rate_all",
+        prompt="You notice pre-competition nerves (racing heart, shallow breathing) an hour before a major event.",
+        helper_text=None,
+        options=[
+            opt("A", "Try to eliminate the nerves completely through distraction (phone, unrelated tasks).", 2),
+            opt("B", "Use a structured routine (breathing, activation cues) to bring energy to your known optimal level.", 5),
+            opt("C", "Interpret the nerves as a bad sign and spiral into worry.", 1),
+            opt("D", "Ignore the sensations and hope they pass on their own.", 2),
+        ],
+    ),
+    dict(
+        order=37, dimension_key="emotion_regulation", question_type="scenario", measurement_type="trait",
+        tier="free", response_mode="rate_all",
+        prompt="You feel flat and low-energy before a competition that matters less to you (e.g., an early-round or “easy” opponent).",
+        helper_text=None,
+        options=[
+            opt("A", "Assume low energy doesn't matter since the opponent is weaker.", 2),
+            opt("B", "Use an activation routine (music, movement, self-talk) to raise energy to an effective level regardless of opponent.", 5),
+            opt("C", "Wait passively for adrenaline to appear once competition starts.", 2),
+            opt("D", "Deliberately underperform since it “doesn't matter.”", 1),
+        ],
+    ),
+    dict(
+        order=38, dimension_key="emotion_regulation", question_type="scenario", measurement_type="trait",
+        tier="free", response_mode="rate_all",
+        prompt="You feel a surge of anger after a bad call or an opponent's unsportsmanlike behavior.",
+        helper_text=None,
+        options=[
+            opt("A", "Let the anger fuel a reckless or retaliatory action.", 1),
+            opt("B", "Acknowledge the anger, then use a specific technique (breath, cue word) to channel it into focused intensity.", 5),
+            opt("C", "Suppress the anger entirely and act as if nothing happened, ignoring the residual tension.", 2),
+            opt("D", "Vent visibly to officials at length before returning focus to the game.", 1),
+        ],
+    ),
+    dict(
+        order=39, dimension_key="emotion_regulation", question_type="scenario", measurement_type="trait",
+        tier="free", response_mode="rate_all",
+        prompt="Between periods/sets/innings/rounds in a close contest, your emotional state is see-sawing between anxiety and overconfidence.",
+        helper_text=None,
+        options=[
+            opt("A", "Let emotions run their course without any intentional regulation.", 2),
+            opt("B", "Use a consistent break-time routine to stabilize your state regardless of the emotional swing.", 5),
+            opt("C", "Try to hype yourself up regardless of your actual internal state.", 2),
+            opt("D", "Avoid teammates/coach during the break to “manage it alone” every time.", 2),
+        ],
+    ),
+    dict(
+        order=40, dimension_key="emotion_regulation", question_type="scenario", measurement_type="trait",
+        tier="free", response_mode="rate_all",
+        prompt="You're competing through minor pain/discomfort that isn't injury-risk but is uncomfortable and distracting.",
+        helper_text=None,
+        options=[
+            opt("A", "Catastrophize the discomfort, letting it dominate your attention.", 1),
+            opt("B", "Acknowledge the sensation without judgment and redirect focus to performance cues.", 5),
+            opt("C", "Grit your teeth and mentally fight the sensation, increasing overall tension.", 2),
+            opt("D", "Communicate with staff between stoppages if it's affecting performance, then refocus.", 4),
+        ],
+    ),
+    # 9. Process Orientation
+    dict(
+        order=41, dimension_key="process_orientation", question_type="scenario", measurement_type="trait",
+        tier="free", response_mode="rate_all",
+        prompt="You execute a technically sound attempt, but the outcome doesn't go your way due to circumstances outside your control (e.g., an opponent makes a great counter, an unlucky break, an unfavorable judgment call).",
+        helper_text=None,
+        options=[
+            opt("A", "Judge the attempt as a failure purely because the result was negative.", 1),
+            opt("B", "Evaluate the attempt based on whether the technique and decision were sound, independent of the result.", 5),
+            opt("C", "Change your technique immediately based on this one outcome.", 2),
+            opt("D", "Feel demoralized and carry that feeling into your next attempt.", 1),
+        ],
+    ),
+    dict(
+        order=42, dimension_key="process_orientation", question_type="scenario", measurement_type="trait",
+        tier="free", response_mode="rate_all",
+        prompt="You're in the middle of a long competition (a match, a race, a multi-event day) and you're behind on the scoreboard/clock.",
+        helper_text=None,
+        options=[
+            opt("A", "Fixate on the scoreboard and calculate what you'd need to do to catch up.", 2),
+            opt("B", "Return attention to the next specific action (next point, next stride, next rep) and execute it on its own merits.", 5),
+            opt("C", "Panic and abandon your game plan to chase the score.", 1),
+            opt("D", "Mentally check out since the scoreboard looks out of reach.", 1),
+        ],
+    ),
+    dict(
+        order=43, dimension_key="process_orientation", question_type="scenario", measurement_type="trait",
+        tier="free", response_mode="rate_all",
+        prompt="Before a high-stakes competition, a teammate keeps talking about “we have to win this” and what winning would mean.",
+        helper_text=None,
+        options=[
+            opt("A", "Join in and let the outcome talk dominate your own pre-competition focus.", 2),
+            opt("B", "Acknowledge the stakes, then redirect your own attention to your specific process goals for the day.", 5),
+            opt("C", "Get visibly annoyed and shut the teammate down harshly.", 2),
+            opt("D", "Say nothing but let the outcome-talk increase your anxiety silently.", 1),
+        ],
+    ),
+    dict(
+        order=44, dimension_key="process_orientation", question_type="scenario", measurement_type="trait",
+        tier="free", response_mode="rate_all",
+        prompt="After a win, your coach asks you to reflect on the performance.",
+        helper_text=None,
+        options=[
+            opt("A", "Say it was a good performance because you won, with no further detail.", 2),
+            opt("B", "Identify specific process elements (decisions, technique, effort) that worked, separate from the result.", 5),
+            opt("C", "Focus only on the parts of the performance that went badly, ignoring the process evaluation.", 2),
+            opt("D", "Avoid reflecting at all since the result was positive.", 1),
+        ],
+    ),
+    dict(
+        order=45, dimension_key="process_orientation", question_type="scenario", measurement_type="trait",
+        tier="free", response_mode="rate_all",
+        prompt="You have one attempt/play left and it will decide the outcome of the competition.",
+        helper_text=None,
+        options=[
+            opt("A", "Think explicitly about what winning or losing will mean for your season/reputation.", 1),
+            opt("B", "Narrow focus to the specific technical cue or process step needed to execute this attempt.", 5),
+            opt("C", "Rush the attempt to relieve the pressure of the moment.", 2),
+            opt("D", "Try to clear your mind of everything, including your usual process cues.", 2),
+        ],
     ),
 ]
-
-
-async def ensure_seeded() -> None:
-    """
-    Populate the assessment tables if they're empty, then make sure every
-    question's translation content is in sync. Safe to call on every startup:
-    the bootstrap insert only runs once, and the content backfill is a cheap
-    no-op once nothing is missing.
-    """
-    async with AsyncSessionLocal() as db:
-        existing = await db.execute(select(AssessmentPhase.id).limit(1))
-        if existing.scalar_one_or_none() is None:
-            await _seed_taxonomy_and_questions(db)
-            await db.commit()
-            print(f"✅ Seeded assessment bank: {len(PHASES)} phases, {len(FACTORS)} factors, "
-                  f"{len(DIMENSIONS)} dimensions, {len(QUESTIONS)} questions.")
-
-        await _backfill_missing_question_content(db)
 
 
 async def _seed_taxonomy_and_questions(db: AsyncSession) -> None:
@@ -746,24 +671,16 @@ async def _seed_taxonomy_and_questions(db: AsyncSession) -> None:
             question_type=QuestionTypeEnum(q["question_type"]),
             measurement_type=MeasurementTypeEnum(q["measurement_type"]),
             tier=QuestionTierEnum(q["tier"]),
-            reverse_scored=q["reverse_scored"],
-            sport_category_overrides=q.get("sport_category_overrides"),
-            position_overrides=q.get("position_overrides"),
+            response_mode=ResponseModeEnum(q["response_mode"]),
+            reverse_scored=False,
         )
-        # Appending (rather than a bare db.add with question_id=...) keeps
-        # question.options populated in-memory, which the content backfill
-        # right after this needs.
         question.options = [AssessmentQuestionOption(**o) for o in q["options"]]
         db.add(question)
     await db.flush()
 
 
 async def _backfill_missing_question_content(db: AsyncSession) -> None:
-    """
-    Populate ContentEntry translation rows for any question that doesn't have
-    them yet — covers the questions just seeded above on a fresh install, and
-    any older data saved before translation support existed.
-    """
+    """Populate ContentEntry translation rows for any question that doesn't have them yet."""
     master = settings.CONTENT_MASTER_LOCALE
     result = await db.execute(select(AssessmentQuestion).options(selectinload(AssessmentQuestion.options)))
     questions = result.scalars().all()
@@ -787,5 +704,45 @@ async def _backfill_missing_question_content(db: AsyncSession) -> None:
     print(f"✅ Backfilled assessment translation content for {len(missing)} question(s).")
 
 
+async def ensure_seeded() -> None:
+    """
+    Populate the assessment tables if they're empty, then make sure every
+    question's translation content is in sync. Safe to call on every startup.
+    """
+    async with AsyncSessionLocal() as db:
+        existing = await db.execute(select(AssessmentPhase.id).limit(1))
+        if existing.scalar_one_or_none() is None:
+            await _seed_taxonomy_and_questions(db)
+            await db.commit()
+            print(f"✅ Seeded assessment bank: {len(PHASES)} phases, {len(FACTORS)} factors, "
+                  f"{len(DIMENSIONS)} dimensions, {len(QUESTIONS)} questions.")
+
+        await _backfill_missing_question_content(db)
+
+
+async def reset_and_reseed() -> None:
+    """
+    Force-clear all existing assessment content (and any in-progress/complete
+    sessions referencing it) and load the bank defined above fresh. This is a
+    deliberate one-time content migration — not run automatically on startup.
+    """
+    async with AsyncSessionLocal() as db:
+        await db.execute(delete(AssessmentResponse))
+        await db.execute(delete(AssessmentSession))
+        await db.execute(delete(AssessmentPhase))  # cascades to factors/dimensions/questions/options
+        await db.execute(delete(ContentEntry).where(ContentEntry.key.like("assessment.questions.%")))
+        await db.commit()
+
+        await _seed_taxonomy_and_questions(db)
+        await db.commit()
+        print(f"✅ Reset and reseeded: {len(PHASES)} phases, {len(FACTORS)} factors, "
+              f"{len(DIMENSIONS)} dimensions, {len(QUESTIONS)} questions.")
+
+        await _backfill_missing_question_content(db)
+
+
 if __name__ == "__main__":
-    asyncio.run(ensure_seeded())
+    if "--reset" in sys.argv:
+        asyncio.run(reset_and_reseed())
+    else:
+        asyncio.run(ensure_seeded())
