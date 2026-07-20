@@ -24,7 +24,7 @@ from app.billing import has_active_access
 from app.config import settings
 from app.database import get_db
 from app.dependencies import get_current_user
-from app.models import Subscription, SubscriptionPlan, SubscriptionStatus, User
+from app.models import PricingPlan, Subscription, SubscriptionPlan, SubscriptionStatus, User
 from app.schemas import (
     BillingStatusResponse,
     CheckoutSessionRequest,
@@ -36,18 +36,18 @@ router = APIRouter(prefix="/billing", tags=["billing"])
 
 stripe.api_key = settings.STRIPE_SECRET_KEY
 
-PRICE_IDS = {
-    "monthly": settings.STRIPE_PRICE_ID_MONTHLY,
-    "yearly": settings.STRIPE_PRICE_ID_YEARLY,
-}
-
 
 def _require_stripe_configured():
-    if not settings.STRIPE_SECRET_KEY or not settings.STRIPE_PRICE_ID_MONTHLY or not settings.STRIPE_PRICE_ID_YEARLY:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Billing isn't configured yet — set STRIPE_SECRET_KEY, STRIPE_PRICE_ID_MONTHLY and STRIPE_PRICE_ID_YEARLY.",
-        )
+    if not settings.STRIPE_SECRET_KEY:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Billing isn't configured yet.")
+
+
+async def _get_elite_plan(db: AsyncSession) -> PricingPlan:
+    result = await db.execute(select(PricingPlan).where(PricingPlan.key == "elite"))
+    plan = result.scalar_one_or_none()
+    if plan is None:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Elite plan not found.")
+    return plan
 
 
 async def _get_or_create_subscription(db: AsyncSession, user: User) -> Subscription:
@@ -57,6 +57,19 @@ async def _get_or_create_subscription(db: AsyncSession, user: User) -> Subscript
         sub = Subscription(user_id=user.id)
         db.add(sub)
     return sub
+
+
+def _status_response(sub: Subscription | None) -> BillingStatusResponse:
+    return BillingStatusResponse(
+        has_access=has_active_access(sub),
+        plan=sub.plan.value if sub else None,
+        status=sub.status.value if sub else None,
+        current_period_end=sub.current_period_end if sub else None,
+        cancel_at_period_end=sub.cancel_at_period_end if sub else False,
+        pending_price_notice=sub.pending_price_notice if sub else False,
+        pending_monthly_amount_cents=sub.pending_monthly_amount_cents if sub else None,
+        pending_yearly_amount_cents=sub.pending_yearly_amount_cents if sub else None,
+    )
 
 
 @router.post("/subscribe-free", response_model=BillingStatusResponse)
@@ -76,13 +89,7 @@ async def subscribe_free(user: User = Depends(get_current_user), db: AsyncSessio
 
     await db.commit()
     await db.refresh(sub)
-    return BillingStatusResponse(
-        has_access=has_active_access(sub),
-        plan=sub.plan.value,
-        status=sub.status.value,
-        current_period_end=sub.current_period_end,
-        cancel_at_period_end=sub.cancel_at_period_end,
-    )
+    return _status_response(sub)
 
 
 @router.post("/checkout-session", response_model=CheckoutSessionResponse)
@@ -94,13 +101,21 @@ async def create_checkout_session(
     """Start (or resume) the Elite subscription purchase."""
     _require_stripe_configured()
 
+    plan = await _get_elite_plan(db)
+    price_id = plan.stripe_price_id_monthly if body.billing_period == "monthly" else plan.stripe_price_id_yearly
+    if not price_id:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Elite pricing hasn't been set up in Stripe yet.",
+        )
+
     result = await db.execute(select(Subscription).where(Subscription.user_id == user.id))
     existing = result.scalar_one_or_none()
     existing_customer_id = existing.stripe_customer_id if existing else None
 
     session_kwargs = dict(
         mode="subscription",
-        line_items=[{"price": PRICE_IDS[body.billing_period], "quantity": 1}],
+        line_items=[{"price": price_id, "quantity": 1}],
         success_url=f"{settings.FRONTEND_URL}/assessment?checkout=success",
         cancel_url=f"{settings.FRONTEND_URL}/pricing?checkout=cancelled",
         client_reference_id=str(user.id),
@@ -134,15 +149,58 @@ async def create_portal_session(user: User = Depends(get_current_user)):
 
 @router.get("/status", response_model=BillingStatusResponse)
 async def billing_status(user: User = Depends(get_current_user)):
-    """The caller's current plan + access state — the frontend uses this to gate the assessment."""
+    """The caller's current plan + access state — the frontend uses this to gate the assessment
+    and to know whether to show the pending-price-change notice."""
+    return _status_response(user.subscription)
+
+
+@router.post("/acknowledge-price-change", response_model=BillingStatusResponse)
+async def acknowledge_price_change(user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    """
+    Accept the new price: swaps the subscription to it with no proration (so
+    it only applies starting the next invoice, never charged mid-cycle) and
+    reverses the cancellation that was scheduled when the notice went out.
+    """
     sub = user.subscription
-    return BillingStatusResponse(
-        has_access=has_active_access(sub),
-        plan=sub.plan.value if sub else None,
-        status=sub.status.value if sub else None,
-        current_period_end=sub.current_period_end if sub else None,
-        cancel_at_period_end=sub.cancel_at_period_end if sub else False,
+    if sub is None or not sub.pending_price_notice or not sub.stripe_subscription_id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No pending price change to acknowledge.")
+
+    plan = await _get_elite_plan(db)
+    stripe_sub = stripe.Subscription.retrieve(sub.stripe_subscription_id)
+    item = stripe_sub["items"]["data"][0]
+    interval = item["price"]["recurring"]["interval"]
+    new_price_id = plan.stripe_price_id_monthly if interval == "month" else plan.stripe_price_id_yearly
+    if not new_price_id:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="New price isn't set up yet.")
+
+    stripe.Subscription.modify(
+        sub.stripe_subscription_id,
+        items=[{"id": item["id"], "price": new_price_id}],
+        proration_behavior="none",
+        cancel_at_period_end=False,
     )
+    sub.cancel_at_period_end = False
+    sub.pending_price_notice = False
+    sub.pending_monthly_amount_cents = None
+    sub.pending_yearly_amount_cents = None
+    await db.commit()
+    await db.refresh(sub)
+    return _status_response(sub)
+
+
+@router.post("/decline-price-change", response_model=BillingStatusResponse)
+async def decline_price_change(user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    """Dismiss the notice — the cancel-at-period-end set when it went out already stands, this just stops showing it."""
+    sub = user.subscription
+    if sub is None or not sub.pending_price_notice:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No pending price change to decline.")
+
+    sub.pending_price_notice = False
+    sub.pending_monthly_amount_cents = None
+    sub.pending_yearly_amount_cents = None
+    await db.commit()
+    await db.refresh(sub)
+    return _status_response(sub)
 
 
 def _period_end(subscription_object: dict) -> datetime | None:
@@ -195,6 +253,11 @@ async def stripe_webhook(request: Request, db: AsyncSession = Depends(get_db)):
             sub.status = SubscriptionStatus(stripe_sub["status"])
             sub.current_period_end = _period_end(stripe_sub)
             sub.cancel_at_period_end = stripe_sub["cancel_at_period_end"]
+            # A fresh checkout means they're subscribing anew (e.g. after a
+            # previous decline lapsed) — any stale notice from before no longer applies.
+            sub.pending_price_notice = False
+            sub.pending_monthly_amount_cents = None
+            sub.pending_yearly_amount_cents = None
             await db.commit()
 
     elif event["type"] in ("customer.subscription.updated", "customer.subscription.deleted"):

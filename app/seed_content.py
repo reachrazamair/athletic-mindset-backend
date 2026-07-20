@@ -206,7 +206,7 @@ CONTENT: dict[str, str] = {
     "home.pricing.eyebrow": "Pricing",
     "home.pricing.titleA": "Choose Your",
     "home.pricing.titleB": "Level",
-    "home.pricing.subtitle": "Start free. Upgrade when you're ready to unlock the full depth of your mental performance profile.",
+    "home.pricing.subtitle": "Start free.  Upgrade when you&apos;re ready to unlock the full depth of your mental performance profile.",
     "home.pricing.monthly": "Monthly",
     "home.pricing.yearly": "Yearly",
     "home.pricing.toggleAria": "Toggle billing period",

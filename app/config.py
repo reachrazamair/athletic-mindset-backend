@@ -57,13 +57,18 @@ class Settings(BaseSettings):
     # --- Billing (Stripe) ---
     # The Elite plan is gated behind an active Stripe subscription (Free is
     # granted directly, no Stripe involved — see POST /billing/subscribe-free).
-    # From the Stripe dashboard: the secret key from Developers > API keys, the
-    # two recurring Prices you create on the Elite product (monthly + yearly),
+    # From the Stripe dashboard: the secret key from Developers > API keys,
     # and the webhook secret from Developers > Webhooks once you've added an
     # endpoint pointing at {this API}/billing/webhook. Empty in dev = billing
     # routes will fail loudly instead of silently accepting fake payments.
     STRIPE_SECRET_KEY: str = ""
     STRIPE_WEBHOOK_SECRET: str = ""
+    # One-time bootstrap only: the two recurring Prices you create on the
+    # Elite product when first setting up Stripe. Used once, at startup, to
+    # backfill the "elite" PricingPlan row with its real Stripe product/price
+    # IDs — after that, checkout reads the price straight from that row, and
+    # admins change the price via PATCH /admin/pricing/plans/{id}/price
+    # instead of editing these. Safe to leave set; safe to clear afterward.
     STRIPE_PRICE_ID_MONTHLY: str = ""
     STRIPE_PRICE_ID_YEARLY: str = ""
 

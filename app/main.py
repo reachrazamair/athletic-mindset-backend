@@ -18,7 +18,7 @@ from sqlalchemy import text
 
 from app.config import settings
 from app.database import engine
-from app.routers import auth, admin, admin_assessment, assessment, billing, profile, content
+from app.routers import auth, admin, admin_assessment, admin_pricing, assessment, billing, pricing, profile, content
 
 
 @asynccontextmanager
@@ -54,6 +54,14 @@ async def lifespan(app: FastAPI):
     except Exception as e:  # noqa: BLE001 — seeding must never block startup
         print(f"⚠️  Assessment seeding skipped: {e}")
 
+    # Auto-seed the pricing plans on first run only (admins own them after that).
+    try:
+        from app.seed_pricing import ensure_seeded as ensure_pricing_seeded
+
+        await ensure_pricing_seeded()
+    except Exception as e:  # noqa: BLE001 — seeding must never block startup
+        print(f"⚠️  Pricing seeding skipped: {e}")
+
     yield  # App runs here
 
     # Shutdown: close connections
@@ -87,6 +95,8 @@ app.include_router(content.router)
 app.include_router(assessment.router)
 app.include_router(admin_assessment.router)
 app.include_router(billing.router)
+app.include_router(pricing.router)
+app.include_router(admin_pricing.router)
 
 
 @app.get("/health")

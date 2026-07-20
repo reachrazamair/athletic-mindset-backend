@@ -130,6 +130,18 @@ class Subscription(Base):
     )
     current_period_end: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     cancel_at_period_end: Mapped[bool] = mapped_column(Boolean, default=False)
+
+    # Set when an admin price change is sent to existing subscribers (see
+    # PATCH /admin/pricing/plans/{id}/price, notify_existing_subscribers=true).
+    # cancel_at_period_end is flipped on at the same time — that's the safe
+    # "no response" default (access lapses at period end, no auto-charge at
+    # the new amount). Acknowledging swaps the subscription to the new price
+    # for the next cycle and clears both; declining just clears this flag,
+    # since the cancellation is already in effect.
+    pending_price_notice: Mapped[bool] = mapped_column(Boolean, default=False)
+    pending_monthly_amount_cents: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    pending_yearly_amount_cents: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
@@ -371,3 +383,55 @@ class AssessmentResponse(Base):
     answered_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
     session: Mapped["AssessmentSession"] = relationship("AssessmentSession", back_populates="responses")
+
+
+# --- Pricing ---
+
+
+class PricingPlan(Base):
+    """
+    One card on the main pricing page (home page #pricing section and
+    /pricing — the same component). `key` is the stable identifier the
+    frontend's checkout wiring switches on (free = granted directly, elite =
+    real Stripe checkout, team = links to /contact) — admins can reword or
+    reprice a plan but the three keys themselves aren't admin-created.
+
+    The price label fields are plain display text — for a plan with a real
+    Stripe price (currently only Elite), they're auto-generated from
+    monthly_amount_cents/yearly_amount_cents whenever those change (see
+    PATCH /admin/pricing/plans/{id}/price), which also mints a new Stripe
+    Price and points checkout at it. Free ($0) and Team ("Custom") have no
+    Stripe price at all — their labels stay plain editable text via the
+    normal content-translation flow.
+    """
+
+    __tablename__ = "pricing_plans"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    key: Mapped[str] = mapped_column(String(50), unique=True, nullable=False)
+    name: Mapped[str] = mapped_column(String(100), nullable=False)
+    description: Mapped[str] = mapped_column(Text, nullable=False)
+    monthly_price_label: Mapped[str] = mapped_column(String(50), nullable=False)  # e.g. "$10.42", "$0", "Custom"
+    monthly_period_label: Mapped[str] = mapped_column(String(50), nullable=False, default="")  # e.g. "/mo", "forever"
+    yearly_price_label: Mapped[str] = mapped_column(String(50), nullable=False)
+    yearly_period_label: Mapped[str] = mapped_column(String(50), nullable=False, default="")
+    # Small note under the price, shown only in the monthly view (e.g. Elite's "Billed as $125/year").
+    note: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    features: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+    # Shown as locked/greyed-out bullets below the regular features (Free tier only, today).
+    locked_features: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+    cta_label: Mapped[str] = mapped_column(String(100), nullable=False)
+    featured: Mapped[bool] = mapped_column(Boolean, default=False)
+    order: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+
+    # Real Stripe pricing — null for plans with no actual charge (Free, Team).
+    stripe_product_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    monthly_amount_cents: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    yearly_amount_cents: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    stripe_price_id_monthly: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    stripe_price_id_yearly: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    currency: Mapped[str] = mapped_column(String(10), nullable=False, default="usd")
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())

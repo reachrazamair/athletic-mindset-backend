@@ -22,7 +22,6 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.assessment_resolver import resolve_question_variant
 from app.billing import require_active_subscription
 from app.database import get_db
 from app.dependencies import get_current_user
@@ -55,7 +54,7 @@ async def list_questions(
     user: User = Depends(require_active_subscription),
     db: AsyncSession = Depends(get_db),
 ):
-    """Active questions for a tier, with prompt text resolved for the caller's sport/position and translated to the requested language."""
+    """Active questions for a tier, with prompt text translated to the requested language."""
     result = await db.execute(
         select(AssessmentQuestion)
         .options(selectinload(AssessmentQuestion.options))
@@ -63,14 +62,11 @@ async def list_questions(
         .order_by(AssessmentQuestion.order)
     )
     questions = result.scalars().all()
-    profile = user.athlete_profile
 
     # Question/option text is admin-authored content, translated the same way
     # as the rest of the site's copy: an English master ContentEntry row per
     # key, auto-translated into any language on first request. Keys look like
     #   assessment.questions.{question_id}.prompt
-    #   assessment.questions.{question_id}.sport_category_overrides.{category}
-    #   assessment.questions.{question_id}.position_overrides.{position}
     #   assessment.questions.{question_id}.options.{option_id}.text
     # (admin_assessment.py keeps these rows in sync whenever a question is saved).
     translations = await _build_locale_map(db, lang)
@@ -80,12 +76,11 @@ async def list_questions(
 
     resolved: list[ResolvedQuestionResponse] = []
     for q in questions:
-        key_suffix, fallback_prompt = resolve_question_variant(q, profile)
         resolved.append(
             ResolvedQuestionResponse(
                 id=q.id,
                 order=q.order,
-                prompt=_t(f"assessment.questions.{q.id}.{key_suffix}", fallback_prompt),
+                prompt=_t(f"assessment.questions.{q.id}.prompt", q.prompt),
                 helper_text=_t(
                     f"assessment.questions.{q.id}.helper_text",
                     q.helper_text or "",

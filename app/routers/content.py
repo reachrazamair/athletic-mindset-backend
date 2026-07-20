@@ -128,6 +128,52 @@ async def _upsert(db: AsyncSession, key: str, locale: str, value: str) -> None:
         entry.value = value
 
 
+async def sync_prefixed_content(db: AsyncSession, prefix: str, items: dict[str, str]) -> None:
+    """
+    Shared by every "admin-authored record with translatable fields" domain
+    (assessment questions, pricing plans, ...): mirror `items` (key suffix ->
+    English text) into ContentEntry under `prefix` as the English master, then
+    refresh translations for every language the site already has. A key that
+    no longer applies (a feature that was removed, an option that was
+    replaced) is cleaned up across all locales. Each caller owns building its
+    own `items` dict — this only owns the actual sync mechanics.
+    """
+    master = settings.CONTENT_MASTER_LOCALE
+    full_items = {f"{prefix}{suffix}": value for suffix, value in items.items()}
+
+    existing = await db.execute(select(ContentEntry).where(ContentEntry.key.like(f"{prefix}%")))
+    for entry in existing.scalars().all():
+        if entry.key not in full_items:
+            await db.delete(entry)
+    await db.flush()
+
+    for key, value in full_items.items():
+        await _upsert(db, key, master, value)
+
+    locales_result = await db.execute(
+        select(ContentEntry.locale).where(ContentEntry.locale != master).distinct()
+    )
+    known_locales = [row[0] for row in locales_result.all()]
+
+    keys = list(full_items.keys())
+    texts = list(full_items.values())
+    for locale in known_locales:
+        translated_texts = await translate_batch(texts, locale)
+        for key, translated in zip(keys, translated_texts):
+            if translated is not None:
+                await _upsert(db, key, locale, translated)
+
+    _clear_cache()
+
+
+async def delete_prefixed_content(db: AsyncSession, prefix: str) -> None:
+    """Remove every content-entry row (all locales) under `prefix` — a deleted record's cleanup."""
+    result = await db.execute(select(ContentEntry).where(ContentEntry.key.like(f"{prefix}%")))
+    for entry in result.scalars().all():
+        await db.delete(entry)
+    _clear_cache()
+
+
 @router.get("/admin/languages", response_model=list[str])
 async def list_languages(
     _: User = Depends(require_role("admin")),

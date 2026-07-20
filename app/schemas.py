@@ -393,7 +393,71 @@ class BillingStatusResponse(BaseModel):
     status: str | None
     current_period_end: datetime | None
     cancel_at_period_end: bool
+    # Set when an admin price change was sent to existing subscribers and this
+    # user hasn't responded yet — the frontend shows the notice popup while true.
+    pending_price_notice: bool
+    pending_monthly_amount_cents: int | None
+    pending_yearly_amount_cents: int | None
 
 
 class CheckoutSessionRequest(BaseModel):
     billing_period: str = Field(default="monthly", pattern="^(monthly|yearly)$")
+
+
+# --- Pricing plans ---
+# Text fields (name/description/features/price labels/...) are edited through
+# the normal CMS Content editor via ContentEntry — no admin CRUD schemas
+# needed for that. Only the real Stripe-backed amount gets a dedicated
+# endpoint, since minting a new Stripe Price is a side effect a plain content
+# save can't do.
+
+class PricingPlanAdminResponse(BaseModel):
+    id: uuid.UUID
+    key: str
+    name: str
+    description: str
+    monthly_price_label: str
+    monthly_period_label: str
+    yearly_price_label: str
+    yearly_period_label: str
+    note: str | None
+    features: list[str]
+    locked_features: list[str]
+    cta_label: str
+    featured: bool
+    order: int
+    is_active: bool
+    stripe_product_id: str | None
+    monthly_amount_cents: int | None
+    yearly_amount_cents: int | None
+    currency: str
+
+    class Config:
+        from_attributes = True
+
+
+class PlanPriceUpdateRequest(BaseModel):
+    monthly_amount_cents: int = Field(ge=0)
+    yearly_amount_cents: int = Field(ge=0)
+    # If true, every currently-active subscriber on this plan is immediately
+    # set to cancel_at_period_end (the safe default) and shown an in-app
+    # notice to acknowledge (move to the new price next cycle) or decline
+    # (let the already-scheduled cancellation stand). If false (default),
+    # this only affects checkout for new customers going forward.
+    notify_existing_subscribers: bool = False
+
+
+class ResolvedPricingPlanResponse(BaseModel):
+    """Public, translated shape — no id-keyed content-sync internals leaked to the frontend."""
+    key: str
+    name: str
+    description: str
+    monthly_price_label: str
+    monthly_period_label: str
+    yearly_price_label: str
+    yearly_period_label: str
+    note: str | None
+    features: list[str]
+    locked_features: list[str]
+    cta_label: str
+    featured: bool
