@@ -18,10 +18,12 @@ router = APIRouter(prefix="/pricing", tags=["pricing"])
 
 
 @router.get("/plans", response_model=list[ResolvedPricingPlanResponse])
-async def list_plans(lang: str = "en", db: AsyncSession = Depends(get_db)):
-    """Active plans, text resolved/translated for the requested language."""
+async def list_plans(lang: str = "en", audience: str = "main", db: AsyncSession = Depends(get_db)):
+    """Active plans for one audience/page, text resolved/translated for the requested language."""
     result = await db.execute(
-        select(PricingPlan).where(PricingPlan.is_active.is_(True)).order_by(PricingPlan.order)
+        select(PricingPlan)
+        .where(PricingPlan.is_active.is_(True), PricingPlan.audience == audience)
+        .order_by(PricingPlan.order)
     )
     plans = result.scalars().all()
 
@@ -46,6 +48,7 @@ async def list_plans(lang: str = "en", db: AsyncSession = Depends(get_db)):
                 features=[_t(f"{prefix}features.{i}", f) for i, f in enumerate(p.features)],
                 locked_features=[_t(f"{prefix}locked_features.{i}", f) for i, f in enumerate(p.locked_features)],
                 cta_label=_t(f"{prefix}cta_label", p.cta_label),
+                cta_href=p.cta_href,
                 featured=p.featured,
             )
         )

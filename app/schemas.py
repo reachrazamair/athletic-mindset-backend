@@ -402,17 +402,58 @@ class BillingStatusResponse(BaseModel):
 
 class CheckoutSessionRequest(BaseModel):
     billing_period: str = Field(default="monthly", pattern="^(monthly|yearly)$")
+    audience: str = Field(default="main", pattern="^(main|athletes|parents|coaches)$")
+    key: str = Field(default="elite", max_length=50)
 
 
 # --- Pricing plans ---
-# Text fields (name/description/features/price labels/...) are edited through
-# the normal CMS Content editor via ContentEntry — no admin CRUD schemas
-# needed for that. Only the real Stripe-backed amount gets a dedicated
-# endpoint, since minting a new Stripe Price is a side effect a plain content
+# Any (audience, key) pair can have real checkout wiring once its Stripe
+# Product/Price is set up (main's Elite and parents' Elite today) — CTAs for
+# plans without one are just marketing links, never wired to checkout.
+# Managed through their own dedicated admin tab rather than the generic
+# Content editor. Only the real Stripe-backed amount gets a dedicated
+# endpoint, since minting a new Stripe Price is a side effect a plain field
 # save can't do.
+
+class PricingPlanCreate(BaseModel):
+    audience: str = Field(default="main", pattern="^(main|athletes|parents|coaches)$")
+    key: str = Field(min_length=1, max_length=50)
+    name: str = Field(min_length=1, max_length=100)
+    description: str = ""
+    monthly_price_label: str = Field(default="", max_length=50)
+    monthly_period_label: str = Field(default="", max_length=50)
+    yearly_price_label: str = Field(default="", max_length=50)
+    yearly_period_label: str = Field(default="", max_length=50)
+    note: str | None = Field(default=None, max_length=255)
+    features: list[str] = Field(default_factory=list)
+    locked_features: list[str] = Field(default_factory=list)
+    cta_label: str = Field(min_length=1, max_length=100)
+    cta_href: str | None = Field(default=None, max_length=255)
+    featured: bool = False
+    order: int = 0
+    is_active: bool = True
+
+
+class PricingPlanUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=100)
+    description: str | None = None
+    monthly_price_label: str | None = Field(default=None, max_length=50)
+    monthly_period_label: str | None = Field(default=None, max_length=50)
+    yearly_price_label: str | None = Field(default=None, max_length=50)
+    yearly_period_label: str | None = Field(default=None, max_length=50)
+    note: str | None = Field(default=None, max_length=255)
+    features: list[str] | None = None
+    locked_features: list[str] | None = None
+    cta_label: str | None = Field(default=None, min_length=1, max_length=100)
+    cta_href: str | None = Field(default=None, max_length=255)
+    featured: bool | None = None
+    order: int | None = None
+    is_active: bool | None = None
+
 
 class PricingPlanAdminResponse(BaseModel):
     id: uuid.UUID
+    audience: str
     key: str
     name: str
     description: str
@@ -424,6 +465,7 @@ class PricingPlanAdminResponse(BaseModel):
     features: list[str]
     locked_features: list[str]
     cta_label: str
+    cta_href: str | None
     featured: bool
     order: int
     is_active: bool
@@ -434,6 +476,15 @@ class PricingPlanAdminResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class PricingPlanReorderItem(BaseModel):
+    id: uuid.UUID
+    order: int
+
+
+class PricingPlanReorderRequest(BaseModel):
+    items: list[PricingPlanReorderItem] = Field(min_length=1)
 
 
 class PlanPriceUpdateRequest(BaseModel):
@@ -460,4 +511,5 @@ class ResolvedPricingPlanResponse(BaseModel):
     features: list[str]
     locked_features: list[str]
     cta_label: str
+    cta_href: str | None
     featured: bool

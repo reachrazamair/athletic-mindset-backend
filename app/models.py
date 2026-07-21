@@ -121,6 +121,12 @@ class Subscription(Base):
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), unique=True, nullable=False
     )
     plan: Mapped[SubscriptionPlan] = mapped_column(Enum(SubscriptionPlan), nullable=False, default=SubscriptionPlan.free)
+    # Which specific PricingPlan row this is (e.g. main's Elite vs. parents'
+    # Elite — same `plan` enum value, different audience/price). Null for
+    # free grants, which aren't audience-specific in a way that matters here.
+    pricing_plan_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("pricing_plans.id"), nullable=True
+    )
     # Null for a free plan granted before Stripe keys were configured — every
     # paid plan has one, created lazily on first checkout.
     stripe_customer_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
@@ -390,25 +396,30 @@ class AssessmentResponse(Base):
 
 class PricingPlan(Base):
     """
-    One card on the main pricing page (home page #pricing section and
-    /pricing — the same component). `key` is the stable identifier the
-    frontend's checkout wiring switches on (free = granted directly, elite =
-    real Stripe checkout, team = links to /contact) — admins can reword or
-    reprice a plan but the three keys themselves aren't admin-created.
+    One pricing card. `audience` scopes it to whichever page shows it — the
+    main pricing page ("main": home #pricing + /pricing, with real checkout
+    wiring keyed off `key` — free = granted directly, elite = real Stripe
+    checkout, team = links to /contact) or one of the marketing pages that
+    show their own tailored pricing copy ("athletes", "parents", "coaches").
+    `key` is only unique per audience, not globally.
+
+    Only "main" plans ever carry real Stripe pricing — the audience-specific
+    pages are pure marketing copy (`cta_href` is a plain link, never wired to
+    checkout), so their price label fields are always plain editable text.
 
     The price label fields are plain display text — for a plan with a real
-    Stripe price (currently only Elite), they're auto-generated from
+    Stripe price (currently only main's Elite), they're auto-generated from
     monthly_amount_cents/yearly_amount_cents whenever those change (see
     PATCH /admin/pricing/plans/{id}/price), which also mints a new Stripe
-    Price and points checkout at it. Free ($0) and Team ("Custom") have no
-    Stripe price at all — their labels stay plain editable text via the
-    normal content-translation flow.
+    Price and points checkout at it.
     """
 
     __tablename__ = "pricing_plans"
+    __table_args__ = (UniqueConstraint("audience", "key", name="uq_pricing_plan_audience_key"),)
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    key: Mapped[str] = mapped_column(String(50), unique=True, nullable=False)
+    audience: Mapped[str] = mapped_column(String(20), nullable=False, default="main")
+    key: Mapped[str] = mapped_column(String(50), nullable=False)
     name: Mapped[str] = mapped_column(String(100), nullable=False)
     description: Mapped[str] = mapped_column(Text, nullable=False)
     monthly_price_label: Mapped[str] = mapped_column(String(50), nullable=False)  # e.g. "$10.42", "$0", "Custom"
@@ -421,11 +432,15 @@ class PricingPlan(Base):
     # Shown as locked/greyed-out bullets below the regular features (Free tier only, today).
     locked_features: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
     cta_label: Mapped[str] = mapped_column(String(100), nullable=False)
+    # Plain link target — only meaningful (and only rendered as a link rather
+    # than a functional checkout button) for non-"main" audiences.
+    cta_href: Mapped[str | None] = mapped_column(String(255), nullable=True)
     featured: Mapped[bool] = mapped_column(Boolean, default=False)
     order: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
 
-    # Real Stripe pricing — null for plans with no actual charge (Free, Team).
+    # Real Stripe pricing — only ever set for "main" audience plans with an
+    # actual charge (Elite). Null for everything else.
     stripe_product_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     monthly_amount_cents: Mapped[int | None] = mapped_column(Integer, nullable=True)
     yearly_amount_cents: Mapped[int | None] = mapped_column(Integer, nullable=True)

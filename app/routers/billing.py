@@ -37,16 +37,28 @@ router = APIRouter(prefix="/billing", tags=["billing"])
 stripe.api_key = settings.STRIPE_SECRET_KEY
 
 
+def _checkout_success_url(audience: str) -> str:
+    return f"{settings.FRONTEND_URL}/dashboard?checkout=success"
+
+
+def _checkout_cancel_url(audience: str) -> str:
+    if audience == "parents":
+        return f"{settings.FRONTEND_URL}/parents?checkout=cancelled"
+    return f"{settings.FRONTEND_URL}/pricing?checkout=cancelled"
+
+
 def _require_stripe_configured():
     if not settings.STRIPE_SECRET_KEY:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Billing isn't configured yet.")
 
 
-async def _get_elite_plan(db: AsyncSession) -> PricingPlan:
-    result = await db.execute(select(PricingPlan).where(PricingPlan.key == "elite"))
+async def _get_plan(db: AsyncSession, audience: str, key: str) -> PricingPlan:
+    """`key` alone isn't unique across audiences (e.g. "elite" exists for both
+    main and parents, at different prices) — always resolve by the pair."""
+    result = await db.execute(select(PricingPlan).where(PricingPlan.audience == audience, PricingPlan.key == key))
     plan = result.scalar_one_or_none()
     if plan is None:
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Elite plan not found.")
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Plan not found.")
     return plan
 
 
@@ -98,15 +110,15 @@ async def create_checkout_session(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Start (or resume) the Elite subscription purchase."""
+    """Start (or resume) a paid subscription purchase for the given (audience, key) plan."""
     _require_stripe_configured()
 
-    plan = await _get_elite_plan(db)
+    plan = await _get_plan(db, body.audience, body.key)
     price_id = plan.stripe_price_id_monthly if body.billing_period == "monthly" else plan.stripe_price_id_yearly
     if not price_id:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Elite pricing hasn't been set up in Stripe yet.",
+            detail="This plan's pricing hasn't been set up in Stripe yet.",
         )
 
     result = await db.execute(select(Subscription).where(Subscription.user_id == user.id))
@@ -116,10 +128,10 @@ async def create_checkout_session(
     session_kwargs = dict(
         mode="subscription",
         line_items=[{"price": price_id, "quantity": 1}],
-        success_url=f"{settings.FRONTEND_URL}/assessment?checkout=success",
-        cancel_url=f"{settings.FRONTEND_URL}/pricing?checkout=cancelled",
+        success_url=_checkout_success_url(plan.audience),
+        cancel_url=_checkout_cancel_url(plan.audience),
         client_reference_id=str(user.id),
-        metadata={"plan": "elite"},
+        metadata={"audience": plan.audience, "key": plan.key},
     )
     # Reuse the same Stripe customer on a repeat purchase (e.g. upgrading from
     # the free plan, or resubscribing after a cancellation) instead of letting
@@ -165,8 +177,19 @@ async def acknowledge_price_change(user: User = Depends(get_current_user), db: A
     if sub is None or not sub.pending_price_notice or not sub.stripe_subscription_id:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No pending price change to acknowledge.")
 
-    plan = await _get_elite_plan(db)
-    stripe_sub = stripe.Subscription.retrieve(sub.stripe_subscription_id)
+    stripe_sub = stripe.Subscription.retrieve(sub.stripe_subscription_id).to_dict()
+    plan = await db.get(PricingPlan, sub.pricing_plan_id) if sub.pricing_plan_id else None
+    if plan is None:
+        items = stripe_sub.get("items", {}).get("data", [])
+        current_product_id = items[0]["price"]["product"] if items else None
+        if current_product_id:
+            plan_result = await db.execute(select(PricingPlan).where(PricingPlan.stripe_product_id == current_product_id))
+            plan = plan_result.scalar_one_or_none()
+            if plan is not None:
+                sub.pricing_plan_id = plan.id
+    if plan is None:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Plan not found.")
+
     item = stripe_sub["items"]["data"][0]
     interval = item["price"]["recurring"]["interval"]
     new_price_id = plan.stripe_price_id_monthly if interval == "month" else plan.stripe_price_id_yearly
@@ -243,11 +266,15 @@ async def stripe_webhook(request: Request, db: AsyncSession = Depends(get_db)):
         user_id = data.get("client_reference_id")
         customer_id = data.get("customer")
         subscription_id = data.get("subscription")
-        plan = (data.get("metadata") or {}).get("plan", "elite")
+        metadata = data.get("metadata") or {}
+        audience = metadata.get("audience", "main")
+        key = metadata.get("key", "elite")
         if user_id and customer_id and subscription_id:
+            plan = await _get_plan(db, audience, key)
             stripe_sub = stripe.Subscription.retrieve(subscription_id).to_dict()
             sub = await _get_or_create_subscription_for_webhook(db, user_id, customer_id)
-            sub.plan = SubscriptionPlan(plan)
+            sub.plan = SubscriptionPlan(plan.key)
+            sub.pricing_plan_id = plan.id
             sub.stripe_customer_id = customer_id
             sub.stripe_subscription_id = subscription_id
             sub.status = SubscriptionStatus(stripe_sub["status"])

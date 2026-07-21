@@ -1,15 +1,11 @@
 """
-ADMIN PRICING ROUTER.
+ADMIN PRICING ROUTER — full CRUD, grouped by audience (main pricing page vs
+the athlete/parent/coach marketing pages, each with their own tailored plans).
 
-Plan text (name, description, features, price labels, ...) is edited through
-the normal CMS Content editor — sync_plan_content already mirrors every
-plan's fields into ContentEntry, and the resolved athlete-facing endpoint
-always prefers a ContentEntry value over the raw column, so no separate CRUD
-UI is needed for that.
-
-What *does* need a dedicated endpoint is the real Stripe-backed amount: a
-Stripe Price is immutable, so "changing the price" means minting a new Price
-and switching checkout over to it — not something a plain text edit can do.
+The real Stripe-backed amount (main audience's Elite only) still gets its own
+dedicated endpoint below the CRUD: a Stripe Price is immutable, so "changing
+the price" means minting a new Price and switching checkout over to it — not
+something a plain field update can do.
 """
 
 from uuid import UUID
@@ -22,9 +18,16 @@ import stripe
 from app.config import settings
 from app.database import get_db
 from app.dependencies import require_role
-from app.models import PricingPlan, Subscription, SubscriptionPlan, SubscriptionStatus, User
-from app.pricing_content_sync import format_price_label, sync_plan_content
-from app.schemas import PlanPriceUpdateRequest, PricingPlanAdminResponse
+from app.models import PricingPlan, Subscription, SubscriptionStatus, User
+from app.pricing_content_sync import delete_plan_content, format_price_label, sync_plan_content
+from app.schemas import (
+    MessageResponse,
+    PlanPriceUpdateRequest,
+    PricingPlanAdminResponse,
+    PricingPlanCreate,
+    PricingPlanReorderRequest,
+    PricingPlanUpdate,
+)
 
 router = APIRouter(prefix="/admin/pricing", tags=["admin-pricing"])
 
@@ -36,8 +39,80 @@ async def list_plans(
     _: User = Depends(require_role("admin")),
     db: AsyncSession = Depends(get_db),
 ):
-    result = await db.execute(select(PricingPlan).order_by(PricingPlan.order))
+    """All plans across every audience — the admin panel groups them client-side."""
+    result = await db.execute(select(PricingPlan).order_by(PricingPlan.audience, PricingPlan.order))
     return result.scalars().all()
+
+
+@router.post("/plans", response_model=PricingPlanAdminResponse, status_code=status.HTTP_201_CREATED)
+async def create_plan(
+    body: PricingPlanCreate,
+    _: User = Depends(require_role("admin")),
+    db: AsyncSession = Depends(get_db),
+):
+    existing = await db.execute(
+        select(PricingPlan).where(PricingPlan.audience == body.audience, PricingPlan.key == body.key)
+    )
+    if existing.scalar_one_or_none() is not None:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="A plan with this key already exists for this audience")
+
+    plan = PricingPlan(**body.model_dump())
+    db.add(plan)
+    await db.flush()
+    await sync_plan_content(db, plan)
+    await db.commit()
+    await db.refresh(plan)
+    return plan
+
+
+@router.patch("/plans/{plan_id}", response_model=PricingPlanAdminResponse)
+async def update_plan(
+    plan_id: UUID,
+    body: PricingPlanUpdate,
+    _: User = Depends(require_role("admin")),
+    db: AsyncSession = Depends(get_db),
+):
+    plan = await db.get(PricingPlan, plan_id)
+    if plan is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Plan not found")
+
+    for field, value in body.model_dump(exclude_unset=True).items():
+        setattr(plan, field, value)
+
+    await db.flush()
+    await sync_plan_content(db, plan)
+    await db.commit()
+    await db.refresh(plan)
+    return plan
+
+
+@router.delete("/plans/{plan_id}", response_model=MessageResponse)
+async def delete_plan(
+    plan_id: UUID,
+    _: User = Depends(require_role("admin")),
+    db: AsyncSession = Depends(get_db),
+):
+    plan = await db.get(PricingPlan, plan_id)
+    if plan is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Plan not found")
+    await delete_plan_content(db, plan_id)
+    await db.delete(plan)
+    await db.commit()
+    return MessageResponse(message="Plan deleted.")
+
+
+@router.patch("/plans/reorder", response_model=MessageResponse)
+async def reorder_plans(
+    body: PricingPlanReorderRequest,
+    _: User = Depends(require_role("admin")),
+    db: AsyncSession = Depends(get_db),
+):
+    for item in body.items:
+        plan = await db.get(PricingPlan, item.id)
+        if plan is not None:
+            plan.order = item.order
+    await db.commit()
+    return MessageResponse(message="Order updated.")
 
 
 @router.patch("/plans/{plan_id}/price", response_model=PricingPlanAdminResponse)
@@ -92,7 +167,7 @@ async def update_plan_price(
     if body.notify_existing_subscribers:
         subs_result = await db.execute(
             select(Subscription).where(
-                Subscription.plan == SubscriptionPlan(plan.key),
+                Subscription.pricing_plan_id == plan.id,
                 Subscription.status.in_([SubscriptionStatus.active, SubscriptionStatus.trialing]),
                 Subscription.stripe_subscription_id.isnot(None),
             )
