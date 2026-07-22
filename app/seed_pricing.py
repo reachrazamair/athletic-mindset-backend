@@ -269,8 +269,8 @@ COACH_PLANS = [
             "Priority support",
         ],
         "locked_features": [],
-        "cta_label": "Book a Team Demo",
-        "cta_href": "/contact",
+        "cta_label": "Get Team Access",
+        "cta_href": None,
         "featured": True,
         "order": 1,
     },
@@ -403,6 +403,47 @@ async def _backfill_athlete_elite_stripe_pricing() -> None:
         print("Created Stripe Product/Prices for Athletes' Elite plan.")
 
 
+async def _backfill_coach_team_stripe_pricing() -> None:
+    """
+    Coach Team is billed annually only — the page has no monthly/yearly
+    toggle, both labels already show the same $499/year figure. Mints one
+    Stripe Price (interval=year) and reuses it for both the monthly and
+    yearly slots, so checkout resolves correctly regardless of which
+    billing_period the frontend happens to send. One-time — no-ops once the
+    plan already has this data.
+    """
+    if not settings.STRIPE_SECRET_KEY:
+        return
+
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(
+            select(PricingPlan).where(PricingPlan.audience == "coaches", PricingPlan.key == "team")
+        )
+        plan = result.scalar_one_or_none()
+        if plan is None or plan.stripe_product_id is not None:
+            return
+
+        stripe.api_key = settings.STRIPE_SECRET_KEY
+        product = stripe.Product.create(name=plan.name)
+        price = stripe.Price.create(
+            product=product.id, unit_amount=49900, currency="usd", recurring={"interval": "year"}
+        )
+
+        plan.stripe_product_id = product.id
+        plan.currency = "usd"
+        plan.monthly_amount_cents = price["unit_amount"]
+        plan.yearly_amount_cents = price["unit_amount"]
+        plan.stripe_price_id_monthly = price["id"]
+        plan.stripe_price_id_yearly = price["id"]
+        plan.monthly_price_label = format_price_label(plan.monthly_amount_cents, plan.currency)
+        plan.yearly_price_label = format_price_label(plan.yearly_amount_cents, plan.currency)
+
+        await db.flush()
+        await sync_plan_content(db, plan)
+        await db.commit()
+        print("Created Stripe Product/Price for Coach Team plan.")
+
+
 async def ensure_seeded() -> None:
     """
     Populate any audience's plans that aren't seeded yet — checked
@@ -427,6 +468,7 @@ async def ensure_seeded() -> None:
     await _backfill_elite_stripe_pricing()
     await _backfill_athlete_elite_stripe_pricing()
     await _backfill_parent_elite_stripe_pricing()
+    await _backfill_coach_team_stripe_pricing()
 
 
 if __name__ == "__main__":

@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
 from app.models import PricingPlan
+from app.pricing_content_sync import format_price_label
 from app.routers.content import _build_locale_map
 from app.schemas import ResolvedPricingPlanResponse
 
@@ -35,14 +36,24 @@ async def list_plans(lang: str = "en", audience: str = "main", db: AsyncSession 
     resolved: list[ResolvedPricingPlanResponse] = []
     for p in plans:
         prefix = f"pricing.plans.{p.id}."
+        monthly_price_label = (
+            format_price_label(p.monthly_amount_cents, p.currency)
+            if p.monthly_amount_cents is not None
+            else p.monthly_price_label
+        )
+        yearly_price_label = (
+            format_price_label(p.yearly_amount_cents, p.currency)
+            if p.yearly_amount_cents is not None
+            else p.yearly_price_label
+        )
         resolved.append(
             ResolvedPricingPlanResponse(
                 key=p.key,
                 name=_t(f"{prefix}name", p.name),
                 description=_t(f"{prefix}description", p.description),
-                monthly_price_label=_t(f"{prefix}monthly_price_label", p.monthly_price_label),
+                monthly_price_label=monthly_price_label,
                 monthly_period_label=_t(f"{prefix}monthly_period_label", p.monthly_period_label),
-                yearly_price_label=_t(f"{prefix}yearly_price_label", p.yearly_price_label),
+                yearly_price_label=yearly_price_label,
                 yearly_period_label=_t(f"{prefix}yearly_period_label", p.yearly_period_label),
                 note=_t(f"{prefix}note", p.note) if p.note else None,
                 features=[_t(f"{prefix}features.{i}", f) for i, f in enumerate(p.features)],

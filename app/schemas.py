@@ -390,6 +390,7 @@ class PortalSessionResponse(BaseModel):
 class BillingStatusResponse(BaseModel):
     has_access: bool
     plan: str | None
+    plan_name: str | None
     status: str | None
     current_period_end: datetime | None
     cancel_at_period_end: bool

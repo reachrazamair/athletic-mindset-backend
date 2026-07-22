@@ -142,7 +142,16 @@ async def update_plan_price(
             detail="This plan has no Stripe product yet — it can't be priced through this endpoint.",
         )
 
-    if body.monthly_amount_cents != plan.monthly_amount_cents:
+    # Some plans (e.g. Coach Team) only ever bill annually — both period
+    # labels already say the same thing ("/year · billed annually"). For
+    # those, the monthly slot is never a real, separately-priced offering:
+    # always mirror it to the yearly side instead of trusting whatever a
+    # (possibly stale) admin client sent for "monthly", so a real
+    # month-interval Stripe Price can never accidentally get minted for a
+    # plan that's supposed to be annual-only.
+    is_annual_only = plan.monthly_period_label == plan.yearly_period_label
+
+    if not is_annual_only and body.monthly_amount_cents != plan.monthly_amount_cents:
         price = stripe.Price.create(
             product=plan.stripe_product_id,
             unit_amount=body.monthly_amount_cents,
@@ -163,6 +172,10 @@ async def update_plan_price(
         plan.stripe_price_id_yearly = price.id
         plan.yearly_amount_cents = body.yearly_amount_cents
         plan.yearly_price_label = format_price_label(body.yearly_amount_cents, plan.currency)
+        if is_annual_only:
+            plan.stripe_price_id_monthly = price.id
+            plan.monthly_amount_cents = body.yearly_amount_cents
+            plan.monthly_price_label = plan.yearly_price_label
 
     if body.notify_existing_subscribers:
         subs_result = await db.execute(
@@ -173,11 +186,11 @@ async def update_plan_price(
             )
         )
         for sub in subs_result.scalars().all():
-            # Safe default: access continues through what they already paid
-            # for, then lapses — unless they acknowledge (see
-            # POST /billing/acknowledge-price-change), which swaps them to
-            # the new price and reverses this.
-            stripe.Subscription.modify(sub.stripe_subscription_id, cancel_at_period_end=True)
+            try:
+                stripe.Subscription.modify(sub.stripe_subscription_id, cancel_at_period_end=True)
+            except stripe.InvalidRequestError:
+                print(f"Skipping stale subscription {sub.stripe_subscription_id} (not found in Stripe).")
+                continue
             sub.cancel_at_period_end = True
             sub.pending_price_notice = True
             sub.pending_monthly_amount_cents = plan.monthly_amount_cents
