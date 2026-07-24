@@ -6,6 +6,7 @@ POST /billing/checkout-session   → start (or resume) an Elite subscription pur
 POST /billing/portal-session     → manage/cancel an existing Stripe subscription
 GET  /billing/status             → the caller's current plan + access state
 POST /billing/webhook            → Stripe's server-to-server event feed (no user auth)
+POST /stripe/webhook             → compatibility alias for the common Stripe CLI command
 
 Paid-plan Subscription rows are never written to from the user-facing
 endpoints below — only the webhook handler mutates them, driven entirely by
@@ -35,6 +36,7 @@ from app.schemas import (
 )
 
 router = APIRouter(prefix="/billing", tags=["billing"])
+stripe_webhook_router = APIRouter(tags=["billing"])
 
 stripe.api_key = settings.STRIPE_SECRET_KEY
 
@@ -169,6 +171,17 @@ async def create_checkout_session(
         cancel_url=_checkout_cancel_url(plan.audience),
         client_reference_id=str(user.id),
         metadata={"audience": plan.audience, "key": plan.key},
+        # Checkout Session metadata is not copied to the Subscription by
+        # Stripe. Put the identity on both objects so later subscription
+        # events can repair local state if checkout.session.completed was
+        # temporarily missed (for example, a local listener was restarted).
+        subscription_data={
+            "metadata": {
+                "user_id": str(user.id),
+                "audience": plan.audience,
+                "key": plan.key,
+            }
+        },
     )
     if existing_customer_id:
         session_kwargs["customer"] = existing_customer_id
@@ -337,6 +350,7 @@ async def _get_or_create_subscription_for_webhook(db: AsyncSession, user_id: str
 
 
 @router.post("/webhook")
+@stripe_webhook_router.post("/stripe/webhook", include_in_schema=False)
 async def stripe_webhook(request: Request, db: AsyncSession = Depends(get_db)):
     """Stripe calls this directly — verified via signature, not user-authenticated."""
     webhook_secret = settings.STRIPE_WEBHOOK_SECRET.strip().strip("\"'")
@@ -385,10 +399,29 @@ async def stripe_webhook(request: Request, db: AsyncSession = Depends(get_db)):
             sub.pending_yearly_amount_cents = None
             await db.commit()
 
-    elif event["type"] in ("customer.subscription.updated", "customer.subscription.deleted"):
+    elif event["type"] in (
+        "customer.subscription.created",
+        "customer.subscription.updated",
+        "customer.subscription.deleted",
+    ):
         subscription_id = data.get("id")
         result = await db.execute(select(Subscription).where(Subscription.stripe_subscription_id == subscription_id))
         sub = result.scalar_one_or_none()
+        # Recovery path for a missed checkout.session.completed event. New
+        # checkouts carry these fields in subscription_data.metadata.
+        if sub is None:
+            metadata = data.get("metadata") or {}
+            user_id = metadata.get("user_id")
+            audience = metadata.get("audience")
+            key = metadata.get("key")
+            customer_id = data.get("customer")
+            if user_id and audience and key and customer_id:
+                plan = await _get_plan(db, audience, key)
+                sub = await _get_or_create_subscription_for_webhook(db, user_id, customer_id)
+                sub.plan = SubscriptionPlan(plan.key)
+                sub.pricing_plan_id = plan.id
+                sub.stripe_customer_id = customer_id
+                sub.stripe_subscription_id = subscription_id
         if sub is not None:
             sub.status = SubscriptionStatus(data["status"])
             sub.current_period_end = _period_end(data)
