@@ -19,7 +19,7 @@ router = APIRouter(prefix="/pricing", tags=["pricing"])
 
 
 @router.get("/plans", response_model=list[ResolvedPricingPlanResponse])
-async def list_plans(lang: str = "en", audience: str = "main", db: AsyncSession = Depends(get_db)):
+async def list_plans(lang: str = "en", audience: str = "athletes", db: AsyncSession = Depends(get_db)):
     """Active plans for one audience/page, text resolved/translated for the requested language."""
     result = await db.execute(
         select(PricingPlan)

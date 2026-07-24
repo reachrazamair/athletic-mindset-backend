@@ -1,15 +1,15 @@
 """
-SEED PRICING — load the pricing plans shown across the site: the main
-pricing page (home #pricing + /pricing) plus the tailored plans shown on the
-athlete/parent/coach marketing pages.
+SEED PRICING — load the pricing plans for the 3 real audiences: athletes,
+parents, coaches. There's no separate "main"/homepage tier — the homepage
+and /pricing read from "athletes" too, since there's no role beyond
+athlete/parent/coach.
 
 The copy below is exactly what was previously hardcoded in each page's own
-component (src/components/landing/Pricing.tsx, athletes/AthletePricing.tsx,
-parents/ParentPricing.tsx, coaches/CoachPricing.tsx), so seeding this doesn't
-change what visitors see — it just moves that content into the database so
-admins can edit it from the CMS instead of a code change. "main", "athletes",
-and "parents" Elite carry real Stripe pricing; coach is still marketing-only
-for now.
+component (athletes/AthletePricing.tsx, parents/ParentPricing.tsx,
+coaches/CoachPricing.tsx), so seeding this doesn't change what visitors see —
+it just moves that content into the database so admins can edit it from the
+CMS instead of a code change. All three audiences' paid tiers (Elite/Elite/
+Team) carry real Stripe pricing.
 
 Run once (and re-run safely) to populate the plans if the table is empty:
     uv run python -m app.seed_pricing
@@ -23,88 +23,6 @@ from app.database import AsyncSessionLocal
 from app.models import PricingPlan
 from app.pricing_content_sync import format_price_label, sync_plan_content
 
-
-MAIN_PLANS = [
-    {
-        "audience": "main",
-        "key": "free",
-        "name": "Free",
-        "description": "Take the full assessment. See 1 of 8 factors unlocked.",
-        "monthly_price_label": "$0",
-        "monthly_period_label": "forever",
-        "yearly_price_label": "$0",
-        "yearly_period_label": "",
-        "note": None,
-        "features": [
-            "Full 22-dimension assessment",
-            "1 factor score unlocked (of 8)",
-            "Overall Athletic Mindset score",
-            "Basic percentile ranking",
-            "One assessment per year",
-        ],
-        "locked_features": [
-            "Full 8-factor breakdown",
-            "22-dimension detailed scores",
-            "Personalized Gameplan",
-            "Mental skills routines",
-            "Sport-specific benchmarking",
-        ],
-        "cta_label": "Start Free Assessment",
-        "featured": False,
-        "order": 0,
-    },
-    {
-        "audience": "main",
-        "key": "elite",
-        "name": "Elite",
-        "description": "Unlock your complete mental performance profile.",
-        "monthly_price_label": "$10.42",
-        "monthly_period_label": "/mo",
-        "yearly_price_label": "$125",
-        "yearly_period_label": "/year",
-        "note": "Billed as $125/year",
-        "features": [
-            "Everything in Free, plus:",
-            "Full detailed report — all 22 dimensions",
-            "Personalized Gameplan with mental skills",
-            "Sport-specific benchmarking",
-            "Elite athlete comparison",
-            "Unlimited reassessments",
-            "Parent & Coach report versions",
-            "Progress tracking over time",
-            "Priority support",
-        ],
-        "locked_features": [],
-        "cta_label": "Get Elite Access",
-        "featured": True,
-        "order": 1,
-    },
-    {
-        "audience": "main",
-        "key": "team",
-        "name": "Team",
-        "description": "Scale across your entire organization.",
-        "monthly_price_label": "Custom",
-        "monthly_period_label": "",
-        "yearly_price_label": "Custom",
-        "yearly_period_label": "",
-        "note": None,
-        "features": [
-            "Everything in Elite, plus:",
-            "Bulk athlete onboarding (CSV, links, QR)",
-            "Coach dashboard with roster view",
-            "Team-level mental readiness analytics",
-            "At-risk athlete identification",
-            "Team Mindset Assessment included",
-            "Partner revenue share program",
-            "Dedicated account support",
-        ],
-        "locked_features": [],
-        "cta_label": "Contact Sales",
-        "featured": False,
-        "order": 2,
-    },
-]
 
 ATHLETE_PLANS = [
     {
@@ -276,56 +194,15 @@ COACH_PLANS = [
     },
 ]
 
-ALL_PLANS = MAIN_PLANS + ATHLETE_PLANS + PARENT_PLANS + COACH_PLANS
-
-
-async def _backfill_elite_stripe_pricing() -> None:
-    """
-    Populate Elite's stripe_product_id/amounts/price IDs from whatever
-    STRIPE_PRICE_ID_MONTHLY/YEARLY are already configured, so the plan starts
-    out matching what checkout actually charges instead of the two being
-    disconnected. One-time — no-ops once the plan already has this data, so
-    it's safe to call on every startup. From then on, admins change the price
-    via PATCH /admin/pricing/plans/{id}/price instead of these env vars.
-    """
-    if not settings.STRIPE_SECRET_KEY or not settings.STRIPE_PRICE_ID_MONTHLY or not settings.STRIPE_PRICE_ID_YEARLY:
-        return
-
-    async with AsyncSessionLocal() as db:
-        result = await db.execute(
-            select(PricingPlan).where(PricingPlan.audience == "main", PricingPlan.key == "elite")
-        )
-        plan = result.scalar_one_or_none()
-        if plan is None or plan.stripe_price_id_monthly is not None:
-            return
-
-        stripe.api_key = settings.STRIPE_SECRET_KEY
-        monthly_price = stripe.Price.retrieve(settings.STRIPE_PRICE_ID_MONTHLY)
-        yearly_price = stripe.Price.retrieve(settings.STRIPE_PRICE_ID_YEARLY)
-
-        plan.stripe_product_id = monthly_price["product"]
-        plan.currency = monthly_price["currency"]
-        plan.monthly_amount_cents = monthly_price["unit_amount"]
-        plan.yearly_amount_cents = yearly_price["unit_amount"]
-        plan.stripe_price_id_monthly = monthly_price["id"]
-        plan.stripe_price_id_yearly = yearly_price["id"]
-        plan.monthly_price_label = format_price_label(plan.monthly_amount_cents, plan.currency)
-        plan.yearly_price_label = format_price_label(plan.yearly_amount_cents, plan.currency)
-
-        await db.flush()
-        await sync_plan_content(db, plan)
-        await db.commit()
-        print("Backfilled Elite plan's Stripe pricing.")
+ALL_PLANS = ATHLETE_PLANS + PARENT_PLANS + COACH_PLANS
 
 
 async def _backfill_parent_elite_stripe_pricing() -> None:
     """
-    Parents' Elite has no pre-existing Stripe Price to adopt (unlike main's,
-    which reuses whatever STRIPE_PRICE_ID_MONTHLY/YEARLY were already set up)
-    — so this creates a brand-new Product + monthly/yearly Prices under the
-    same Stripe account. One-time — no-ops once the plan already has this
-    data. From then on, admins change the price via
-    PATCH /admin/pricing/plans/{id}/price instead of this script.
+    Creates a brand-new Stripe Product + monthly/yearly Prices for Parents'
+    Elite. One-time — no-ops once the plan already has this data. From then
+    on, admins change the price via PATCH /admin/pricing/plans/{id}/price
+    instead of this script.
     """
     if not settings.STRIPE_SECRET_KEY:
         return
@@ -452,7 +329,7 @@ async def ensure_seeded() -> None:
     since admin-edited. Safe to call on every startup.
     """
     async with AsyncSessionLocal() as db:
-        for data_list in (MAIN_PLANS, ATHLETE_PLANS, PARENT_PLANS, COACH_PLANS):
+        for data_list in (ATHLETE_PLANS, PARENT_PLANS, COACH_PLANS):
             audience = data_list[0]["audience"]
             existing = await db.execute(select(PricingPlan.id).where(PricingPlan.audience == audience).limit(1))
             if existing.scalar_one_or_none() is not None:
@@ -465,7 +342,6 @@ async def ensure_seeded() -> None:
             print(f"Seeded {len(data_list)} pricing plans for audience '{audience}'.")
         await db.commit()
 
-    await _backfill_elite_stripe_pricing()
     await _backfill_athlete_elite_stripe_pricing()
     await _backfill_parent_elite_stripe_pricing()
     await _backfill_coach_team_stripe_pricing()

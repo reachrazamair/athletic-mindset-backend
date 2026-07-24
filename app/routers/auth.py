@@ -26,7 +26,7 @@ from app.config import settings
 from app.database import get_db
 from app.dependencies import get_current_user
 from app.email import render_email, send_email
-from app.models import RoleEnum, User, UserRole
+from app.models import CoachReferral, RoleEnum, User, UserRole
 from app.schemas import (
     ChangePasswordRequest,
     DeactivateAccountRequest,
@@ -76,6 +76,7 @@ async def register(body: RegisterRequest, db: AsyncSession = Depends(get_db)):
         hashed_password=hash_password(body.password),
         first_name=body.first_name,
         last_name=body.last_name,
+        pending_referral_code=body.referral_code,
     )
     db.add(user)
     await db.commit()
@@ -225,6 +226,30 @@ async def set_role(
     # Add role
     user_role = UserRole(user_id=user.id, role=RoleEnum(body.role))
     db.add(user_role)
+
+    # Resolve a pending Partner Program referral now that we know the role —
+    # only athletes can be referred, and only into a real coach's code.
+    if body.role == "athlete" and user.pending_referral_code:
+        coach_result = await db.execute(
+            select(User).join(UserRole).where(
+                User.referral_code == user.pending_referral_code, UserRole.role == RoleEnum.coach
+            )
+        )
+        coach = coach_result.scalar_one_or_none()
+        if coach is not None:
+            existing_referral = await db.execute(
+                select(CoachReferral).where(CoachReferral.athlete_user_id == user.id)
+            )
+            if existing_referral.scalar_one_or_none() is None:
+                db.add(
+                    CoachReferral(
+                        coach_user_id=coach.id,
+                        athlete_user_id=user.id,
+                        referral_code=user.pending_referral_code,
+                    )
+                )
+        user.pending_referral_code = None
+
     await db.commit()
     await db.refresh(user)
 

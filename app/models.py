@@ -45,6 +45,14 @@ class User(Base):
     last_name: Mapped[str | None] = mapped_column(String(100), nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     is_verified: Mapped[bool] = mapped_column(Boolean, default=False)
+    # A coach's own shareable Partner Program code — generated lazily on
+    # first request, null for every other role.
+    referral_code: Mapped[str | None] = mapped_column(String(16), unique=True, nullable=True)
+    # Holds a would-be referral between registration and role selection —
+    # role isn't known yet at register() time, so this survives that gap
+    # (including the multi-day email-verification wait) until set_role()
+    # resolves it into a CoachReferral row, or discards it if invalid.
+    pending_referral_code: Mapped[str | None] = mapped_column(String(16), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
@@ -136,6 +144,12 @@ class Subscription(Base):
     )
     current_period_end: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     cancel_at_period_end: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Stripe's actual recurring interval for this subscription ("month" / "year"),
+    # read straight off the Stripe Subscription in the webhook — lets the pricing
+    # pages tell "current plan, current billing period" apart from "current plan,
+    # but not this period" when a monthly/yearly toggle is involved. Null for free
+    # grants and for subscriptions created before this column existed.
+    billing_interval: Mapped[str | None] = mapped_column(String(10), nullable=True)
 
     # Set when an admin price change is sent to existing subscribers (see
     # PATCH /admin/pricing/plans/{id}/price, notify_existing_subscribers=true).
@@ -186,6 +200,31 @@ class UserRole(Base):
 
     # Relationships
     user: Mapped["User"] = relationship("User", back_populates="roles")
+
+
+class CoachReferral(Base):
+    """
+    One row per athlete attributed to a coach's Partner Program referral
+    link — the attribution foundation the future commission/payout stages
+    will build on (see .agents/imp-docs/PARTNER_PROGRAM.md). Deliberately
+    minimal for now: no commission or Stripe Connect fields until those
+    stages are real.
+    """
+
+    __tablename__ = "coach_referrals"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    coach_user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    # An athlete is attributed to exactly one coach — first referral wins.
+    athlete_user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), unique=True, nullable=False
+    )
+    # Denormalized so this stays a true audit trail even if the coach's own
+    # referral_code is ever regenerated later.
+    referral_code: Mapped[str] = mapped_column(String(16), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
 # --- Assessment ---
@@ -396,20 +435,18 @@ class AssessmentResponse(Base):
 
 class PricingPlan(Base):
     """
-    One pricing card. `audience` scopes it to whichever page shows it — the
-    main pricing page ("main": home #pricing + /pricing, with real checkout
-    wiring keyed off `key` — free = granted directly, elite = real Stripe
-    checkout, team = links to /contact) or one of the marketing pages that
-    show their own tailored pricing copy ("athletes", "parents", "coaches").
-    `key` is only unique per audience, not globally.
+    One pricing card. `audience` scopes it to whichever role's page shows
+    it — "athletes", "parents", or "coaches" (only 3 real audiences; there's
+    no separate generic tier — the homepage and /pricing read from
+    "athletes" too). `key` is only unique per audience, not globally.
 
-    Only "main" plans ever carry real Stripe pricing — the audience-specific
-    pages are pure marketing copy (`cta_href` is a plain link, never wired to
-    checkout), so their price label fields are always plain editable text.
+    Plans with a real Stripe price (Elite for athletes/parents, Team for
+    coaches) have functional checkout buttons; a plan without one just
+    renders `cta_href` as a plain link.
 
     The price label fields are plain display text — for a plan with a real
-    Stripe price (currently only main's Elite), they're auto-generated from
-    monthly_amount_cents/yearly_amount_cents whenever those change (see
+    Stripe price, they're auto-generated from monthly_amount_cents/
+    yearly_amount_cents whenever those change (see
     PATCH /admin/pricing/plans/{id}/price), which also mints a new Stripe
     Price and points checkout at it.
     """
@@ -418,7 +455,7 @@ class PricingPlan(Base):
     __table_args__ = (UniqueConstraint("audience", "key", name="uq_pricing_plan_audience_key"),)
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    audience: Mapped[str] = mapped_column(String(20), nullable=False, default="main")
+    audience: Mapped[str] = mapped_column(String(20), nullable=False, default="athletes")
     key: Mapped[str] = mapped_column(String(50), nullable=False)
     name: Mapped[str] = mapped_column(String(100), nullable=False)
     description: Mapped[str] = mapped_column(Text, nullable=False)
@@ -432,15 +469,15 @@ class PricingPlan(Base):
     # Shown as locked/greyed-out bullets below the regular features (Free tier only, today).
     locked_features: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
     cta_label: Mapped[str] = mapped_column(String(100), nullable=False)
-    # Plain link target — only meaningful (and only rendered as a link rather
-    # than a functional checkout button) for non-"main" audiences.
+    # Plain link target — only rendered as a link (rather than a functional
+    # checkout button) for a plan with no Stripe product set up.
     cta_href: Mapped[str | None] = mapped_column(String(255), nullable=True)
     featured: Mapped[bool] = mapped_column(Boolean, default=False)
     order: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
 
-    # Real Stripe pricing — only ever set for "main" audience plans with an
-    # actual charge (Elite). Null for everything else.
+    # Real Stripe pricing — set for any plan with an actual charge
+    # (athletes'/parents' Elite, coaches' Team). Null for Free plans.
     stripe_product_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     monthly_amount_cents: Mapped[int | None] = mapped_column(Integer, nullable=True)
     yearly_amount_cents: Mapped[int | None] = mapped_column(Integer, nullable=True)

@@ -18,7 +18,7 @@ from sqlalchemy import text
 
 from app.config import settings
 from app.database import engine
-from app.routers import auth, admin, admin_assessment, admin_pricing, assessment, billing, pricing, profile, content
+from app.routers import auth, admin, admin_assessment, admin_pricing, assessment, billing, coach, pricing, profile, content
 
 
 @asynccontextmanager
@@ -97,6 +97,7 @@ app.include_router(admin_assessment.router)
 app.include_router(billing.router)
 app.include_router(pricing.router)
 app.include_router(admin_pricing.router)
+app.include_router(coach.router)
 
 
 @app.get("/health")

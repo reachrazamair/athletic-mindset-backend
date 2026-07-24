@@ -18,6 +18,10 @@ class RegisterRequest(BaseModel):
     password: str = Field(min_length=8, max_length=128)
     first_name: str | None = Field(default=None, max_length=100)
     last_name: str | None = Field(default=None, max_length=100)
+    # A coach's Partner Program referral code, captured from ?ref= on
+    # whatever page the visitor first landed on. Not validated here — role
+    # isn't known yet, so resolution happens later in set_role().
+    referral_code: str | None = Field(default=None, max_length=16)
 
 
 class LoginRequest(BaseModel):
@@ -27,6 +31,12 @@ class LoginRequest(BaseModel):
 
 class SetRoleRequest(BaseModel):
     role: str = Field(pattern="^(athlete|parent|coach)$")
+
+
+class CoachReferralResponse(BaseModel):
+    code: str
+    referral_link: str
+    total_referred: int
 
 
 class ForgotPasswordRequest(BaseModel):
@@ -391,6 +401,13 @@ class BillingStatusResponse(BaseModel):
     has_access: bool
     plan: str | None
     plan_name: str | None
+    # Audience of the PricingPlan the subscriber is actually on (athletes/parents/coaches)
+    # and the real Stripe billing interval ("month"/"year") — both language-independent,
+    # unlike plan_name, so the frontend can safely match against a specific plan card
+    # (by key + audience) and its currently-toggled billing period.
+    plan_audience: str | None = None
+    plan_billing_period: str | None = None
+    plan_is_annual_only: bool = False
     status: str | None
     current_period_end: datetime | None
     cancel_at_period_end: bool
@@ -403,21 +420,26 @@ class BillingStatusResponse(BaseModel):
 
 class CheckoutSessionRequest(BaseModel):
     billing_period: str = Field(default="monthly", pattern="^(monthly|yearly)$")
-    audience: str = Field(default="main", pattern="^(main|athletes|parents|coaches)$")
+    audience: str = Field(default="athletes", pattern="^(athletes|parents|coaches)$")
     key: str = Field(default="elite", max_length=50)
 
 
+class ChangeBillingPeriodRequest(BaseModel):
+    billing_period: str = Field(pattern="^(monthly|yearly)$")
+
+
 # --- Pricing plans ---
-# Any (audience, key) pair can have real checkout wiring once its Stripe
-# Product/Price is set up (main's Elite and parents' Elite today) — CTAs for
-# plans without one are just marketing links, never wired to checkout.
-# Managed through their own dedicated admin tab rather than the generic
-# Content editor. Only the real Stripe-backed amount gets a dedicated
-# endpoint, since minting a new Stripe Price is a side effect a plain field
-# save can't do.
+# Only 3 real audiences exist — athletes, parents, coaches (no separate
+# "main"/homepage tier; that was a redundant duplicate of athletes' plans
+# and has been removed). Any (audience, key) pair can have real checkout
+# wiring once its Stripe Product/Price is set up — CTAs for plans without
+# one are just marketing links, never wired to checkout. Managed through
+# their own dedicated admin tab rather than the generic Content editor.
+# Only the real Stripe-backed amount gets a dedicated endpoint, since
+# minting a new Stripe Price is a side effect a plain field save can't do.
 
 class PricingPlanCreate(BaseModel):
-    audience: str = Field(default="main", pattern="^(main|athletes|parents|coaches)$")
+    audience: str = Field(default="athletes", pattern="^(athletes|parents|coaches)$")
     key: str = Field(min_length=1, max_length=50)
     name: str = Field(min_length=1, max_length=100)
     description: str = ""

@@ -27,6 +27,7 @@ from app.dependencies import get_current_user
 from app.models import PricingPlan, Subscription, SubscriptionPlan, SubscriptionStatus, User
 from app.schemas import (
     BillingStatusResponse,
+    ChangeBillingPeriodRequest,
     CheckoutSessionRequest,
     CheckoutSessionResponse,
     PortalSessionResponse,
@@ -73,13 +74,21 @@ async def _get_or_create_subscription(db: AsyncSession, user: User) -> Subscript
 
 async def _status_response(db: AsyncSession, sub: Subscription | None) -> BillingStatusResponse:
     plan_name = None
+    plan_audience = None
+    plan_is_annual_only = False
     if sub and sub.pricing_plan_id:
         plan = await db.get(PricingPlan, sub.pricing_plan_id)
-        plan_name = plan.name if plan else None
+        if plan:
+            plan_name = plan.name
+            plan_audience = plan.audience
+            plan_is_annual_only = plan.monthly_period_label == plan.yearly_period_label
     return BillingStatusResponse(
         has_access=has_active_access(sub),
         plan=sub.plan.value if sub else None,
         plan_name=plan_name,
+        plan_audience=plan_audience,
+        plan_billing_period=sub.billing_interval if sub else None,
+        plan_is_annual_only=plan_is_annual_only,
         status=sub.status.value if sub else None,
         current_period_end=sub.current_period_end if sub else None,
         cancel_at_period_end=sub.cancel_at_period_end if sub else False,
@@ -139,6 +148,19 @@ async def create_checkout_session(
     existing = result.scalar_one_or_none()
     existing_customer_id = existing.stripe_customer_id if existing else None
 
+    # A real paid Stripe subscription already exists — a second Checkout
+    # Session would create a second, parallel subscription (double-billing)
+    # rather than changing this one. Switching plans/intervals goes through
+    # POST /billing/change-billing-period or the portal instead.
+    if existing and existing.stripe_subscription_id and existing.status in (
+        SubscriptionStatus.active,
+        SubscriptionStatus.trialing,
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="You already have an active subscription. Manage it from your billing settings.",
+        )
+
     session_kwargs = dict(
         mode="subscription",
         line_items=[{"price": price_id, "quantity": 1}],
@@ -154,6 +176,53 @@ async def create_checkout_session(
 
     checkout_session = stripe.checkout.Session.create(**session_kwargs)
     return CheckoutSessionResponse(checkout_url=checkout_session.url)
+
+
+@router.post("/change-billing-period", response_model=BillingStatusResponse)
+async def change_billing_period(
+    body: ChangeBillingPeriodRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Switch the caller's existing paid subscription between monthly/yearly for the
+    *same* plan — modifies the live Stripe subscription in place (Stripe prorates the
+    difference) instead of starting a new Checkout Session, which would otherwise
+    leave the customer with two parallel subscriptions."""
+    _require_stripe_configured()
+    sub = user.subscription
+    if sub is None or not sub.stripe_subscription_id or not sub.pricing_plan_id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No active subscription to change.")
+
+    plan = await db.get(PricingPlan, sub.pricing_plan_id)
+    if plan is None:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Plan not found.")
+
+    is_annual_only = plan.monthly_period_label == plan.yearly_period_label
+    new_price_id = (
+        plan.stripe_price_id_yearly
+        if is_annual_only or body.billing_period == "yearly"
+        else plan.stripe_price_id_monthly
+    )
+    if not new_price_id:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="This plan's pricing hasn't been set up in Stripe yet.",
+        )
+
+    stripe_sub = stripe.Subscription.retrieve(sub.stripe_subscription_id).to_dict()
+    item = stripe_sub["items"]["data"][0]
+    if item["price"]["id"] == new_price_id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Already on that billing period.")
+
+    updated = stripe.Subscription.modify(
+        sub.stripe_subscription_id,
+        items=[{"id": item["id"], "price": new_price_id}],
+    ).to_dict()
+    sub.billing_interval = _billing_interval(updated)
+    sub.current_period_end = _period_end(updated)
+    await db.commit()
+    await db.refresh(sub)
+    return await _status_response(db, sub)
 
 
 @router.post("/portal-session", response_model=PortalSessionResponse)
@@ -247,6 +316,16 @@ def _period_end(subscription_object: dict) -> datetime | None:
     return datetime.fromtimestamp(items[0]["current_period_end"], tz=timezone.utc)
 
 
+def _billing_interval(subscription_object: dict) -> str | None:
+    """Stripe's real recurring interval ("month" / "year") for this subscription's
+    price — read straight off the item so the frontend can tell "current plan,
+    current billing period" apart from "current plan, other toggle position"."""
+    items = (subscription_object.get("items") or {}).get("data") or []
+    if not items:
+        return None
+    return items[0].get("price", {}).get("recurring", {}).get("interval")
+
+
 async def _get_or_create_subscription_for_webhook(db: AsyncSession, user_id: str, customer_id: str) -> Subscription:
     result = await db.execute(select(Subscription).where(Subscription.user_id == user_id))
     sub = result.scalar_one_or_none()
@@ -276,7 +355,7 @@ async def stripe_webhook(request: Request, db: AsyncSession = Depends(get_db)):
         customer_id = data.get("customer")
         subscription_id = data.get("subscription")
         metadata = data.get("metadata") or {}
-        audience = metadata.get("audience", "main")
+        audience = metadata.get("audience", "athletes")
         key = metadata.get("key", "elite")
         if user_id and customer_id and subscription_id:
             plan = await _get_plan(db, audience, key)
@@ -289,6 +368,7 @@ async def stripe_webhook(request: Request, db: AsyncSession = Depends(get_db)):
             sub.status = SubscriptionStatus(stripe_sub["status"])
             sub.current_period_end = _period_end(stripe_sub)
             sub.cancel_at_period_end = stripe_sub["cancel_at_period_end"]
+            sub.billing_interval = _billing_interval(stripe_sub)
             # A fresh checkout means they're subscribing anew (e.g. after a
             # previous decline lapsed) — any stale notice from before no longer applies.
             sub.pending_price_notice = False
@@ -304,6 +384,7 @@ async def stripe_webhook(request: Request, db: AsyncSession = Depends(get_db)):
             sub.status = SubscriptionStatus(data["status"])
             sub.current_period_end = _period_end(data)
             sub.cancel_at_period_end = data["cancel_at_period_end"]
+            sub.billing_interval = _billing_interval(data)
             await db.commit()
 
     return {"received": True}
