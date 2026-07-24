@@ -11,7 +11,9 @@ Why use this instead of reading os.environ directly?
 - One place to see every setting the app needs
 """
 
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from typing import Type
+
+from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict
 
 
 class Settings(BaseSettings):
@@ -78,6 +80,24 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         extra="ignore",
     )
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: Type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        # In local development we want the checked-in .env file to win over any
+        # stale machine-level variables left behind by other shells/tools.
+        return (
+            init_settings,
+            dotenv_settings,
+            env_settings,
+            file_secret_settings,
+        )
 
 
 # Create one instance — import this wherever you need settings

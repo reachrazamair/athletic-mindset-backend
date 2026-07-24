@@ -57,12 +57,28 @@ class User(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
     # Relationships
-    roles: Mapped[list["UserRole"]] = relationship("UserRole", back_populates="user", lazy="selectin")
+    roles: Mapped[list["UserRole"]] = relationship(
+        "UserRole",
+        back_populates="user",
+        lazy="selectin",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
     athlete_profile: Mapped["AthleteProfile | None"] = relationship(
-        "AthleteProfile", back_populates="user", uselist=False, lazy="selectin", cascade="all, delete-orphan"
+        "AthleteProfile",
+        back_populates="user",
+        uselist=False,
+        lazy="selectin",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
     )
     subscription: Mapped["Subscription | None"] = relationship(
-        "Subscription", back_populates="user", uselist=False, lazy="selectin", cascade="all, delete-orphan"
+        "Subscription",
+        back_populates="user",
+        uselist=False,
+        lazy="selectin",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
     )
 
 
